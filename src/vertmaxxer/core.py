@@ -68,7 +68,9 @@ class OptionError(ValueError):
 
 CACHE_DIR = Path(os.environ.get("VERTMAXXER_CACHE", Path.home() / ".cache" / "vertmaxxer"))
 OVERPASS_WAITS = [5, 10, 20, 30, 45, 60, 60, 60]  # s after each failed attempt: about five minutes in all
-OVERPASS_URLS = ["https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter"]
+OVERPASS_URLS = ["https://overpass-api.de/api/interpreter", "https://overpass.openstreetmap.fr/api/interpreter",
+                 "https://overpass.kumi.systems/api/interpreter"]
+_DEAD_MIRRORS = set()  # mirrors that answered with an internal error this run
 DEM_URL = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
 DEM_RES_DEG = 1.0 / 3 / 3600  # 1/3 arc-second, ~10 m
 DEM_TILE_PX = 1000  # larger requests often time out at the USGS server
@@ -167,15 +169,26 @@ def _overpass(query, prefix):
     """Run an Overpass query, trying each mirror, with the result cached on disk."""
     def fetch():
         print("Querying Overpass...")
+        timeouts = 0
         for attempt, wait in enumerate(OVERPASS_WAITS):
-            url = OVERPASS_URLS[attempt % len(OVERPASS_URLS)]
+            live = [u for u in OVERPASS_URLS if u not in _DEAD_MIRRORS] or OVERPASS_URLS
+            url = live[attempt % len(live)]
             try:
                 r = requests.post(url, data={"data": query}, headers=HEADERS, timeout=360)
+                if r.status_code == 500 and url != OVERPASS_URLS[0]:
+                    _DEAD_MIRRORS.add(url)
+                if r.status_code == 429:  # rate limited: give it longer
+                    wait = max(wait, 60)
                 r.raise_for_status()
                 data = r.json()
                 # Server-side timeouts and out-of-memory errors come back as 200 with partial data and a remark.
                 remark = data.get("remark", "")
+                if "out of memory" in remark:
+                    raise VertmaxxerError("The query is too big for the Overpass server; try a shorter distance")
                 if "runtime error" in remark or "timed out" in remark:
+                    timeouts += 1
+                    if timeouts > 2:
+                        raise VertmaxxerError("Overpass keeps timing out on this query; try a shorter distance")
                     raise requests.RequestException(remark)
                 return data
             except (requests.RequestException, ValueError) as err:
@@ -229,7 +242,7 @@ def _is_road(highway):
 
 def _not_a_start(tags):
     """Roads a street start doesn't snap to: highways, and driveways and parking aisles."""
-    return tags["highway"] in MAJOR_ROADS or tags.get("service") in NOT_ROUTES
+    return tags.get("highway") in MAJOR_ROADS or tags.get("service") in NOT_ROUTES
 
 
 def _usable(tags, roads, max_sac):
@@ -263,8 +276,11 @@ def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, cl
     ``length`` (m) and ``road``.
     """
     nodes = {el["id"]: (el["lat"], el["lon"]) for el in osm["elements"] if el["type"] == "node"}
-    ways = [el for el in osm["elements"] if el["type"] == "way" and "highway" in el.get("tags", {})
-            and (el["id"] in include or _usable(el["tags"], roads, max_sac))]
+    # Included ways count as footpaths when they have no highway tag (a pier, a plaza).
+    ways = [dict(el, tags={"highway": "footway", **el.get("tags", {})}) if el["id"] in include else el
+            for el in osm["elements"] if el["type"] == "way"]
+    ways = [w for w in ways if "highway" in w.get("tags", {})
+            and (w["id"] in include or _usable(w["tags"], roads, max_sac))]
     if not ways:
         raise VertmaxxerError("No usable ways found near the trailhead(s).")
     if closed:
@@ -297,8 +313,8 @@ def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, cl
             i = int(np.argmin(d))
         tags = next(iter(f" ({w['tags'].get('name', w['tags']['highway'])})" for w in snap_ways if way_nodes[i] in w["nodes"]))
         if report is None or k < report:
-            print(f"({lat}, {lon}) snapped {d[i]:.0f} m to OSM node {way_nodes[i]}{tags}, "
-                  f"in a network of {comp_size[way_nodes[i]]} nodes")
+            size = "" if on_road else f", in a trail network of {comp_size[way_nodes[i]]} nodes"
+            print(f"({lat}, {lon}) snapped {d[i]:.0f} m to OSM node {way_nodes[i]}{tags}{size}")
         anchor_ids.append(int(way_nodes[i]))
 
     count = Counter(n for w in ways for n in w["nodes"])
@@ -1034,22 +1050,33 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
     solver.parameters.log_search_progress = verbose
     t0 = time.time()
 
+    turn_units = round(20 * turn_penalty)
+
+    def gain_ft(value, sol):
+        """The route's gain from the objective, without the turnaround costs it includes."""
+        if turn_units:
+            value += (-1 if minimize else 1) * turn_units * sum(sol.Value(x) for x in leaves)
+        return value / 20 * M_TO_FT
+
     class Progress(cp_model.CpSolverSolutionCallback):
-        best = 0.0
+        best = None
 
         def on_solution_callback(self):
-            gain = self.ObjectiveValue() / 20
-            if gain > 1.005 * self.best:
-                print(f"  {time.time() - t0:6.1f} s  gain {gain * M_TO_FT:7,.0f} ft  "
-                      f"(bound {self.BestObjectiveBound() / 20 * M_TO_FT:,.0f} ft)")
+            gain = gain_ft(self.ObjectiveValue(), self)
+            if _improved(gain, self.best, minimize):
+                score = f"score {self.ObjectiveValue() / 20 * M_TO_FT:,.0f} ft, " if turn_units else ""
+                print(f"  {time.time() - t0:6.1f} s  gain {gain:7,.0f} ft  "
+                      f"({score}bound {self.BestObjectiveBound() / 20 * M_TO_FT:,.0f} ft)")
                 self.best = gain
 
     print(f"Solving: {N} nodes, {E} edges, {time_limit:.0f} s limit, {workers} workers")
     status = solver.Solve(md, Progress())
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise VertmaxxerError(_no_route(solver.StatusName(status), time_limit))
-    print(f"  {solver.StatusName(status).lower()}: gain {solver.ObjectiveValue() / 20 * M_TO_FT:,.0f} ft, "
-          f"bound {solver.BestObjectiveBound() / 20 * M_TO_FT:,.0f} ft")
+    score = (f"score {solver.ObjectiveValue() / 20 * M_TO_FT:,.0f} ft (gain less the turnaround costs), "
+             if turn_units else "")
+    print(f"  {solver.StatusName(status).lower()}: gain {gain_ft(solver.ObjectiveValue(), solver):,.0f} ft, "
+          f"{score}bound {solver.BestObjectiveBound() / 20 * M_TO_FT:,.0f} ft")
 
     m = np.array([solver.Value(a[e]) + 2 * solver.Value(b[e]) for e in range(E)])
     start = starts[next(i for i in range(len(S)) if solver.Value(s[i]))]
@@ -1058,6 +1085,11 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
 
 
 # ---------------------------------------------------------------- output
+
+def _improved(gain, best, minimize):
+    """Whether a solution is worth a progress line: 0.5% better than the last one shown."""
+    return best is None or (gain < 0.995 * best if minimize else gain > 1.005 * best)
+
 
 def _no_route(status, time_limit):
     if status == "UNKNOWN":

@@ -366,3 +366,100 @@ def test_parallel_short_ways_collapse():
     e = lambda u, v, L, road=False: dict(u=u, v=v, length=L, road=road)
     edges = api._tidy([e(1, 2, 3), e(2, 1, 12), e(2, 3, 400), e(3, 2, 900), e(3, 4, 50, True)], {1})
     assert sorted((x["u"], x["v"], x["length"]) for x in edges) == [(1, 2, 3), (2, 3, 400), (3, 2, 900)]
+
+
+# ---------------------------------------------------------------- follow-up report
+
+def test_lollipop_seed_is_a_stem_and_a_loop():
+    e = lambda u, v, L, var, road=0: dict(u=u, v=v, length=L, var=var, road_len=road)
+    edges = [e("S", "A", 1000, 50), e("A", "B", 1000, 80), e("B", "C", 1000, 80), e("C", "A", 1000, 80)]
+    counts = api._seed(edges, "S", 6000, core.TOPOLOGIES["lollipop"], 1609, 0.25)
+    assert list(counts) == [2, 1, 1, 1]
+    assert api._seed(edges, "A", 6000, core.TOPOLOGIES["loop"], 1609, 0.25).tolist() == [0, 1, 1, 1]
+    assert api._seed(edges, "S", 4000, core.TOPOLOGIES["lollipop"], 1609, 0.25) is None  # 2 + 3 km doesn't fit
+    # With road walking capped, a stem that walks a road doesn't count.
+    edges[0]["road_len"] = 1000
+    assert api._seed(edges, "S", 6000, core.TOPOLOGIES["lollipop"], 1609, 0.25, max_road_frac=0.1) is None
+    assert list(api._seed(edges, "S", 6000, core.TOPOLOGIES["lollipop"], 1609, 0.25)) == [2, 1, 1, 1]
+
+
+def test_minimize_progress_reports_improvements():
+    assert core._improved(100, None, True) and core._improved(90, 100, True) and not core._improved(110, 100, True)
+    assert core._improved(110, 100, False) and not core._improved(90, 100, False)
+
+
+def test_progress_gain_is_the_routes(offline, capsys):
+    trail = [(i + 1, PTS[i * 10:(i + 1) * 10 + 1], PATH) for i in range(10)]
+    offline(osm(trail))
+    r = run(PTS[0], 4, "out-and-back")
+    final = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip().startswith(("optimal:", "feasible:"))][-1]
+    shown = float(final.split("gain")[1].split("ft")[0].replace(",", ""))
+    assert abs(shown - r.gain_ft) < 3
+
+
+def test_included_way_without_highway_tag(offline):
+    pier = (77, [PTS[0], (43.999, -72.0), (43.999, -72.001)], {"man_made": "pier"})
+    offline(osm([(1, PTS, PATH), pier]))
+    r = run(PTS[0], 2, "out-and-back", ways={"include": [77]})
+    assert r.shape == "out-and-back"
+
+
+def test_malformed_files_are_option_errors(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"include": [1, 2,')
+    with pytest.raises(vm.OptionError, match="bad.json"):
+        vm.find_route((44.0, -72.0), 5, ways=bad)
+    notc = tmp_path / "notc.json"
+    notc.write_text('{"include": [1]}')
+    with pytest.raises(vm.OptionError, match="notc.json"):
+        vm.find_route((44.0, -72.0), 5, closures=notc)
+
+
+def test_overpass_out_of_memory_stops_at_once(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "CACHE_DIR", tmp_path)
+    slept = []
+    monkeypatch.setattr(core.time, "sleep", slept.append)
+    monkeypatch.setattr(core.requests, "post", lambda *a, **k: Reply(
+        {"elements": [], "remark": "runtime error: Query run out of memory using about 2048 MB of RAM."}))
+    with pytest.raises(vm.VertmaxxerError, match="shorter distance"):
+        core._overpass("q", "osm")
+    assert not slept
+
+
+def test_overpass_timeouts_stop_after_a_few(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "CACHE_DIR", tmp_path)
+    calls = []
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+    monkeypatch.setattr(core.requests, "post", lambda *a, **k: calls.append(1) or Reply(
+        {"elements": [], "remark": "runtime error: Query timed out in \"query\" at line 1 after 301 seconds."}))
+    with pytest.raises(vm.VertmaxxerError, match="timing out"):
+        core._overpass("q", "osm")
+    assert len(calls) == 3
+
+
+def test_dead_mirror_is_skipped(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(core, "_DEAD_MIRRORS", set())
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+    urls = []
+
+    def post(url, *a, **k):
+        urls.append(url)
+        return Reply({}, 504 if url == core.OVERPASS_URLS[0] else 500)
+    monkeypatch.setattr(core.requests, "post", post)
+    with pytest.raises(vm.VertmaxxerError):
+        core._overpass("q", "osm")
+    for mirror in core.OVERPASS_URLS[1:]:
+        assert urls.count(mirror) == 1
+
+
+def test_manitou_campus_is_closed():
+    closed = core.load_closures(sorted(core.CLOSURES_DIR.glob("*.json")))
+    campus = json.load(open(core.CLOSURES_DIR / "manitou_school_2026-10.json"))["closed_segments"]
+    assert len(campus) >= 20 and all(frozenset(s) in closed for s in campus)
+
+
+def test_moffatt_drive_is_closed():
+    closed = core.load_closures(sorted(core.CLOSURES_DIR.glob("*.json")))
+    drive = json.load(open(core.CLOSURES_DIR / "moffatt_healy_drive_2026-10.json"))["closed_segments"]
+    assert drive and all(frozenset(s) in closed for s in drive)

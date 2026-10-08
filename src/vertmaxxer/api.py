@@ -72,7 +72,7 @@ def _nearer_street(osm, point):
     best = {True: np.inf, False: np.inf}
     for w in osm["elements"]:
         tags = w.get("tags", {})
-        if w["type"] != "way" or not core._usable(tags, True, None) or core._not_a_start(tags):
+        if w["type"] != "way" or "highway" not in tags or not core._usable(tags, True, None) or core._not_a_start(tags):
             continue
         ll = np.array([nodes[n] for n in w["nodes"] if n in nodes])
         if len(ll):
@@ -108,6 +108,79 @@ def _tidy(edges, keep, short_m=100.0):
         if not stubs:
             return edges
         edges = [e for e in edges if id(e) not in stubs]
+
+
+def _graph(edges, avoid=(), road_weight=1.0):
+    """Simple graph of ``edges`` clear of the nodes in ``avoid``, keeping the lightest of parallel edges, with road
+    meters weighted ``road_weight`` times (to keep shortest paths off roads)."""
+    G = nx.Graph()
+    for k, e in enumerate(edges):
+        w = e["length"] + (road_weight - 1) * e.get("road_len", 0.0)
+        if e["u"] != e["v"] and e["u"] not in avoid and e["v"] not in avoid \
+                and G.get_edge_data(e["u"], e["v"], {}).get("w", np.inf) > w:
+            G.add_edge(e["u"], e["v"], w=w, k=k)
+    return G
+
+
+def _loops_through(edges, node, lo, hi, avoid=(), tries=30, road_weight=1.0):
+    """Simple loops through ``node``, ``lo`` to ``hi`` m long and clear of the nodes in ``avoid``, as lists of indices
+    into ``edges``, climbiest first: two node-disjoint shortest paths to each of up to ``tries`` turnarounds."""
+    G = _graph(edges, avoid, road_weight)
+    if node not in G:
+        return []
+    dist, path = nx.single_source_dijkstra(G, node, cutoff=hi / 2, weight="w")
+    far = sorted((n for n in dist if dist[n] >= lo / 4), key=dist.get)
+    found = []
+    for X in far[:: max(1, len(far) // tries)]:
+        p1 = path[X]
+        H = nx.restricted_view(G, p1[1:-1], [(p1[0], p1[1])] if len(p1) == 2 else [])
+        try:
+            _, p2 = nx.single_source_dijkstra(H, node, X, cutoff=2 * hi, weight="w")
+        except nx.NetworkXNoPath:
+            continue
+        ks = [G[u][v]["k"] for q in (p1, p2) for u, v in zip(q, q[1:])]
+        if lo <= sum(edges[k]["length"] for k in ks) <= hi:
+            found.append((sum(edges[k]["var"] for k in ks), ks))
+    return [ks for _, ks in sorted(found, key=lambda f: -f[0])]
+
+
+def _seed(edges, start, budget, shape, min_loop, min_loop_frac, max_road_frac=None, stems=8):
+    """A quick route to start the solver from, as a count per edge: for a loop, a loop through the start; for a
+    lollipop, the climbiest of a few loops at the ends of short stems; within ``max_road_frac`` of road, if given.
+    None for other shapes, or if none fits. Dense networks can otherwise take the solver minutes just to find a
+    first route."""
+    if shape["loops"] != 1 or shape["spurs"] != 0 or shape["start"] not in ("loop", "stem"):
+        return None
+    rw = 1.0 if max_road_frac is None else 5.0  # keep off roads where they're capped
+
+    def counts_of(loop, stem=()):
+        c = np.zeros(len(edges), int)
+        c[list(loop)] = 1
+        c[list(stem)] = 2
+        if max_road_frac is not None:
+            road = sum(edges[k]["road_len"] * c[k] for k in np.flatnonzero(c))
+            if road > max_road_frac * sum(edges[k]["length"] * c[k] for k in np.flatnonzero(c)):
+                return None
+        return c
+
+    def best(cands):
+        cands = [c for c in cands if c is not None]
+        return max(cands, key=lambda c: float(np.dot(c, [e["var"] for e in edges])), default=None)
+
+    if shape["start"] == "loop":
+        return best(counts_of(ks) for ks in _loops_through(edges, start, min_loop, budget, road_weight=rw))
+    G = _graph(edges, road_weight=rw)
+    if start not in G:
+        return None
+    dist, path = nx.single_source_dijkstra(G, start, cutoff=budget / 4, weight="w")
+    cands = []
+    for X in sorted((n for n in dist if dist[n] > 0), key=dist.get)[:: max(1, len(dist) // stems)]:
+        stem = [G[u][v]["k"] for u, v in zip(path[X], path[X][1:])]
+        d = sum(edges[k]["length"] for k in stem)
+        lo = max(min_loop, 2 * d * min_loop_frac / (1 - min_loop_frac)) * 1.01
+        for ks in _loops_through(edges, X, lo, budget - 2 * d, avoid=set(path[X][:-1]), tries=10, road_weight=rw)[:3]:
+            cands.append(counts_of(ks, stem))
+    return best(cands)
 
 
 def _points(p):
@@ -174,8 +247,18 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
         if not os.path.isfile(f):
             raise OptionError(f"no such file: {f}")
     if isinstance(ways, (str, os.PathLike)):
-        ways = json.load(open(ways))
+        try:
+            ways = json.load(open(ways))
+        except ValueError as err:
+            raise OptionError(f"{ways} isn't valid JSON: {err}")
     ways = ways or {}
+    if not isinstance(ways, dict):
+        raise OptionError('ways must be {"include": [OSM way ids], "exclude": [...]}')
+    for f in closures:
+        try:
+            core.load_closures([f])
+        except (ValueError, KeyError, TypeError) as err:
+            raise OptionError(f'{f} isn\'t a closures file ({{"closed_segments": [[node, node], ...]}}): {err!r}')
     include, exclude = set(ways.get("include", ())), set(ways.get("exclude", ()))
 
     budget = distance_mi * MI_TO_M
@@ -236,11 +319,13 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
     if shape["spurs"] != 0:
         edges = _tidy(edges, set(starts) | set(ends or ()))
 
+    hint = None if budget_flat or ends else _seed(edges, starts[0], budget, shape, min_loop_mi * MI_TO_M, min_loop_frac,
+                                                  None if any_roads else max_road_fraction)
     m, s, t, proven = core.solve(edges, starts, ends, budget_flat or budget, shape, min_loop_mi * MI_TO_M, time_limit_s, workers,
                                  verbose, min_loop_frac=min_loop_frac, road_time_frac=road_time_frac,
                                  minimize=minimize, max_road_frac=None if any_roads else max_road_fraction,
                                  min_length=0.98 * budget if minimize else 0.0,
-                                 turn_penalty=TURN_PENALTY_M if shape["spurs"] != 0 else 0.0)
+                                 turn_penalty=TURN_PENALTY_M if shape["spurs"] != 0 else 0.0, hint=hint)
     return _route(edges, m, s, t, proven, min_loop_mi * MI_TO_M, min_loop_frac, heads, anchors)
 
 

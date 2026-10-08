@@ -23,8 +23,10 @@ run near the same start is much faster.
 
 ## Vertmaxx a route
 
-1. **Get the start as `lat,lon`.** In Google Maps, right-click the trailhead and click the coordinates to copy
-   them. Use the parking lot or trailhead; the route starts from the nearest trail.
+1. **Get the start as `lat,lon`.** In Google Maps, right-click the spot and click the coordinates to copy them.
+   The route starts on the nearest trail or street to that point. From a house, it walks the streets to the
+   trails: the first 400 m are free, and the rest counts toward `--max-road-fraction`. To start on a particular
+   trail, put the point on it.
 2. **Pick a distance** in miles. This is a maximum; the route can come in shorter if the extra distance would add
    no climbing.
 3. **Pick a shape:**

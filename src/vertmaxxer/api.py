@@ -64,6 +64,21 @@ def _route(edges, m, start, end, proven, min_loop, min_loop_frac, heads=None, an
                  details=details, proven=bool(proven), end=(heads or {}).get(end), edges=edges, anchors=anchors)
 
 
+def _nearer_street(osm, point):
+    """Whether a street is nearer ``point`` than any trail (a start in town, say, rather than at a trailhead)."""
+    nodes = {el["id"]: (el["lat"], el["lon"]) for el in osm["elements"] if el["type"] == "node"}
+    best = {True: np.inf, False: np.inf}
+    for w in osm["elements"]:
+        tags = w.get("tags", {})
+        if w["type"] != "way" or not core._usable(tags, True, None) or core._not_a_start(tags):
+            continue
+        ll = np.array([nodes[n] for n in w["nodes"] if n in nodes])
+        if len(ll):
+            road = core._is_road(tags["highway"])
+            best[road] = min(best[road], float(core._haversine(*point, ll[:, 0], ll[:, 1]).min()))
+    return best[True] < best[False]
+
+
 def _points(p):
     """One (lat, lon) or a list of them, as a list."""
     return [tuple(map(float, p))] if np.ndim(p) == 1 else [tuple(map(float, q)) for q in p]
@@ -140,8 +155,10 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
         osm = core.fetch_osm(anchors, budget / 2, True)
     if exclude:
         osm = dict(osm, elements=[el for el in osm["elements"] if not (el["type"] == "way" and el["id"] in exclude)])
-    edges, anchor_ids = core.build_graph(osm, True, max_sac, anchors, extra_ids=heads, closed=closed,
-                                         snap_roads=range(len(anchors)) if roads_only else ())
+    # A start nearer a street than a trail starts on the street; the walk from it to the trails is a road walk.
+    street = (list(range(len(anchors))) if roads_only
+              else [k for k, p in enumerate(starts_ll) if _nearer_street(osm, p)])
+    edges, anchor_ids = core.build_graph(osm, True, max_sac, anchors, extra_ids=heads, closed=closed, snap_roads=street)
     if any_roads:  # major roads only where they meet others
         edges = [e for e in edges if not e.get("major")]
     else:  # trails, and road walks between them; crossings and the start's own roads are free
@@ -149,6 +166,7 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
         free |= core.trailhead_roads(edges, anchor_ids[: len(starts_ll)], trailhead_roads_m)
         minor = [e for e in edges if not e.get("major")]
         walks = {id(e) for e in core.road_connectors(minor, max_road_fraction * budget)}
+        walks |= core.trailhead_roads(edges, [anchor_ids[k] for k in street], max_road_fraction * budget)
         edges = [dict(e, roadpt=np.zeros_like(e["roadpt"])) if id(e) in free else e
                  for e in edges if id(e) in free | walks]
     if paved_only:

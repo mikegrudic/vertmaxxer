@@ -202,6 +202,11 @@ def _is_road(highway):
     return highway in ROAD_HIGHWAYS or highway in MAJOR_ROADS
 
 
+def _not_a_start(tags):
+    """Roads a street start doesn't snap to: highways, and driveways and parking aisles."""
+    return tags["highway"] in MAJOR_ROADS or tags.get("service") in NOT_ROUTES
+
+
 def _usable(tags, roads, max_sac):
     foot = tags.get("foot")
     if foot in ("no", "private"):
@@ -240,7 +245,8 @@ def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, cl
     anchor_ids = []
     for k, (lat, lon) in enumerate(anchors):
         on_road = k in snap_roads
-        snap_ways = [w for w in ways if _is_road(w["tags"]["highway"]) == on_road]
+        snap_ways = [w for w in ways if _is_road(w["tags"]["highway"]) == on_road
+                     and not (on_road and _not_a_start(w["tags"]))]
         way_nodes = np.array(sorted({n for w in snap_ways for n in w["nodes"]}))
         way_ll = np.array([nodes[n] for n in way_nodes])
         # Snap to the nearest node of the biggest trail network within SNAP_M, so a stub path at a
@@ -360,13 +366,13 @@ def road_network(edges, include=frozenset(), link_m=30.0):
 
 
 def trailhead_roads(edges, starts, max_m):
-    """Ids of the roads (not major ones) lying entirely within ``max_m`` of a start: its parking lots and access
-    roads."""
+    """Ids of the roads (not highways or driveways) lying entirely within ``max_m`` of a start: its parking lots
+    and access roads, or the streets from a start in town."""
     at = {}
     for e in edges:
         at[e["u"]], at[e["v"]] = e["latlon"][0], e["latlon"][-1]
     pts = [at[n] for n in starts if n in at]
-    return {id(e) for e in edges if e["road"] and not e.get("major")
+    return {id(e) for e in edges if e["road"] and not e.get("major") and e.get("service") != "driveway"
             and any(np.all(_haversine(e["latlon"][:, 0], e["latlon"][:, 1], *p) <= max_m) for p in pts)}
 
 

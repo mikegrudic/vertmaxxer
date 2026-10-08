@@ -1,6 +1,7 @@
 """Command-line tools: ``vertmaxxer`` finds a route, ``vertmaxxer-spurify`` adds summit side trips to one."""
 import argparse
 import os
+import re
 import sys
 
 from . import core
@@ -23,6 +24,18 @@ def _time_h(text):
     if ":" not in text and h > 24:
         raise argparse.ArgumentTypeError(f"{text} hours? Give the time as H:MM, e.g. 1:30")
     return h
+
+
+def _attach_negative(argv):
+    """``--start -73.9,41.4`` as ``--start=-73.9,41.4``: argparse reads a value starting with "-" as an option."""
+    out, it = [], iter(argv)
+    for tok in it:
+        nxt = next(it, None) if tok in ("--start", "--end") else None
+        if nxt is not None and re.match(r"-[\d.]", nxt):
+            out.append(f"{tok}={nxt}")
+        else:
+            out += [tok] + ([nxt] if nxt is not None else [])
+    return out
 
 
 def _line_buffered():
@@ -126,12 +139,13 @@ def main(argv=None):
     p.add_argument("--dem", choices=["3dep", "terrarium"], default="3dep", help="elevation source")
     p.add_argument("--smooth", type=float, default=50.0, help="elevation smoothing e-folding length (m)")
     p.add_argument("--seg-max", type=float, default=500.0, help="turnaround resolution when spurs are allowed (m)")
-    p.add_argument("--time-limit", type=float, default=120.0, help="solver time limit (s)")
+    p.add_argument("--time-limit", type=float,
+                   help="solver time limit (s; default 120, or 600 for figure-8, dumbbell and double-lollipop)")
     p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1), help="solver threads")
     p.add_argument("--verbose", action="store_true", help="show the CP-SAT search log")
     p.add_argument("-o", "--output", default="vertmaxxer.gpx", help="GPX to write (default vertmaxxer.gpx)")
     p.add_argument("--plot", help="also write a map + profile figure here (needs matplotlib)")
-    a = p.parse_args(argv)
+    a = p.parse_args(_attach_negative(sys.argv[1:] if argv is None else argv))
     _line_buffered()
     if a.max_road_fraction is not None and (a.roads or a.roads_only):
         p.error("--max-road-fraction limits roads on trail routes; --roads and --roads-only allow any amount")
@@ -169,7 +183,8 @@ def main(argv=None):
     elif a.pace:
         print(f"{_fmt(r.distance_mi * a.pace / 60)} at {_fmt(a.pace)}/mi")
     if a.topology != "any" and r.shape != a.topology:
-        print(f"Warning: asked for a {a.topology}, but the best route found has another shape ({r.shape})")
+        print(f"Warning: asked for a {a.topology}, but the best route found has another shape ({r.shape})",
+              file=sys.stderr)
     _write(r.write_gpx, a.output)
     if a.plot:
         _write(r.plot, a.plot)

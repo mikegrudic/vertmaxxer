@@ -101,7 +101,7 @@ By default it plays by the same rules as the published survey:
 | `--max-road-fraction F` | At most this share of the distance on roads (default 0.1; 0 for trails only) |
 | `--trailhead-roads M` | Walkable roads around the start, in meters (default 400; 0 for none) |
 | `--any-end` | Allow traverses to end on the Mount Washington Auto Road, at its summit, or on Breakneck Road |
-| `--time-limit S` | Seconds to search (default 120). Give long routes, or `figure-8`, `dumbbell` and `any`, 600 or more |
+| `--time-limit S` | Seconds to search (default 120; 600 for `figure-8`, `dumbbell` and `double-lollipop`). Long routes and `any` often improve with 600 or more |
 | `--end LAT,LON` | Finish here (with `--topology traverse`) |
 | `--end-trailheads` | Finish at whichever trailhead gives the most gain (with `--topology traverse`) |
 | `--closures FILE` | Also avoid the closed segments listed in FILE (format as in `src/vertmaxxer/data/closures/`) |

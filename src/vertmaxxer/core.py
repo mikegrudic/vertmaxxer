@@ -44,6 +44,7 @@ import json
 import heapq
 import math
 import os
+import sys
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -81,7 +82,9 @@ MI_TO_M = 1609.344
 M_TO_FT = 3.280839895
 RESAMPLE_M = 10.0
 SNAP_M = 500.0
-SNAP_WARN_M, SNAP_FAIL_M = 200.0, 1000.0  # a start or end this far from any usable way is suspect, or an error
+SNAP_WARN_M, SNAP_FAIL_M = 200.0, 1000.0
+STREET_SNAP_M = 100.0  # a street start snaps to the biggest street network this close (not a cut-off lane)
+FETCH_PAD_M = 1000.0  # downloads reach this much further than asked, for reuse  # a start or end this far from any usable way is suspect, or an error
 GAP_M = 10.0  # join a trail's dead end to another trail this close: an OSM digitizing gap
 GAP_SAME_NAME_M = 50.0  # ... or to a trail of the same name this close
 GAP_TABLE = Path(__file__).parent / "data" / "strava_GAP_table.dat"
@@ -158,32 +161,61 @@ def _cached(name, fetch, load, save, keep=lambda data: True):
 # ---------------------------------------------------------------- OSM graph
 
 def fetch_osm(points, radius_m, roads, way_ids=()):
-    """Trails (and roads) within ``radius_m`` of the points, plus the ways in ``way_ids`` whatever their type."""
-    highways = "|".join(dict.fromkeys(TRAIL_HIGHWAYS + (ROAD_HIGHWAYS + MAJOR_ROADS if roads else [])))
-    clauses = "".join(
-        f'way["highway"~"^({highways})$"](around:{radius_m:.0f},{lat:.6f},{lon:.6f});' for lat, lon in points
-    )
-    if way_ids:
-        clauses += f"way(id:{','.join(map(str, sorted(way_ids)))});"
-    query = f"[out:json][timeout:300];({clauses});(._;>;);out body;"
-    # A download covering these circles (same road setting, the same extra ways or more) serves too: the graph is
-    # pruned to the budget anyway. Each download's circles are kept beside it.
-    here = CACHE_DIR / f"osm_{_key(query)}.json"
-    if not here.exists():
-        for meta in CACHE_DIR.glob("osm_*.meta.json"):
-            try:
-                m = json.loads(meta.read_text())
-                if (m["roads"] >= bool(roads) and set(m["way_ids"]) >= set(way_ids)
-                        and all(any(_haversine(*p, *q) + radius_m <= m["radius"] for q in m["points"]) for p in points)):
-                    return json.loads(meta.with_name(meta.name.replace(".meta.json", ".json")).read_text())
-            except (OSError, ValueError, KeyError, TypeError):
-                continue
-    data = _overpass(query, "osm")
+    """Trails (and roads) within ``radius_m`` of the points, plus the ways in ``way_ids`` whatever their type.
+
+    From the cache when a download covers it: the exact query, or else the smallest download whose circles contain
+    these (same or more roads, the same extra ways or more), clipped to them. New downloads reach FETCH_PAD_M
+    further, so a later start nearby or a slightly longer route reuses them."""
+    points = [tuple(map(float, p)) for p in points]
+
+    def query(r):
+        highways = "|".join(dict.fromkeys(TRAIL_HIGHWAYS + (ROAD_HIGHWAYS + MAJOR_ROADS if roads else [])))
+        clauses = "".join(f'way["highway"~"^({highways})$"](around:{r:.0f},{la:.6f},{lo:.6f});' for la, lo in points)
+        if way_ids:
+            clauses += f"way(id:{','.join(map(str, sorted(way_ids)))});"
+        return f"[out:json][timeout:300];({clauses});(._;>;);out body;"
+
+    exact = CACHE_DIR / f"osm_{_key(query(radius_m))}.json"
+    if exact.exists():
+        return _overpass(query(radius_m), "osm")
+    best = None
+    for meta in CACHE_DIR.glob("osm_*.meta.json"):
+        try:
+            m = json.loads(meta.read_text())
+            if (m["roads"] >= bool(roads) and set(m["way_ids"]) >= set(way_ids)
+                    and all(any(_haversine(*p, *q) + radius_m <= m["radius"] for q in m["points"]) for p in points)
+                    and (best is None or m["radius"] < best[0])):
+                best = (m["radius"], meta.with_name(meta.name.replace(".meta.json", ".json")))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    if best is not None:
+        try:
+            return _clip(json.loads(best[1].read_text()), points, radius_m, way_ids)
+        except (OSError, ValueError):
+            pass
+    padded = radius_m + FETCH_PAD_M
+    data = _overpass(query(padded), "osm")
+    here = CACHE_DIR / f"osm_{_key(query(padded))}.json"
     if here.exists():
-        meta = dict(points=[list(map(float, p)) for p in points], radius=float(radius_m), roads=bool(roads),
-                    way_ids=sorted(way_ids))
+        meta = dict(points=[list(p) for p in points], radius=float(padded), roads=bool(roads), way_ids=sorted(way_ids))
         here.with_name(here.name.replace(".json", ".meta.json")).write_text(json.dumps(meta))
-    return data
+    return _clip(data, points, radius_m, way_ids)
+
+
+def _clip(data, points, radius_m, way_ids=()):
+    """The ways of an Overpass answer with a node within ``radius_m`` of a point (or listed in ``way_ids``), and their
+    nodes."""
+    nodes = {e["id"]: e for e in data["elements"] if e["type"] == "node"}
+    ids = np.array(list(nodes))
+    ll = np.array([(nodes[n]["lat"], nodes[n]["lon"]) for n in ids]).reshape(-1, 2)
+    near = np.zeros(len(ids), bool)
+    for la, lo in points:
+        near |= _haversine(la, lo, ll[:, 0], ll[:, 1]) <= radius_m
+    inside = set(ids[near].tolist())
+    ways = [e for e in data["elements"] if e["type"] == "way"
+            and (e["id"] in way_ids or any(n in inside for n in e["nodes"]))]
+    used = {n for w in ways for n in w["nodes"]}
+    return dict(data, elements=[nodes[n] for n in used if n in nodes] + ways)
 
 
 def _key(query):
@@ -224,7 +256,8 @@ def _overpass(query, prefix):
         raise VertmaxxerError("All Overpass servers failed; try again later.")
 
     return _cached(f"{prefix}_{_key(query)}.json", fetch, lambda p: json.loads(p.read_text()),
-                   lambda p, d: p.write_text(json.dumps(d)), keep=lambda d: bool(d.get("elements")))
+                   lambda p, d: p.write_text(json.dumps(d)),
+                   keep=lambda d: bool(d.get("elements")) or prefix != "osm")  # no peaks nearby is an answer
 
 
 def _drivable(tags):
@@ -250,7 +283,7 @@ def road_trailheads(osm, points, radius_m, roads, max_sac, closed=frozenset()):
         if not _drivable(tags):
             continue
         for n in w["nodes"]:
-            road_name.setdefault(n, tags.get("name") or tags.get("ref") or tags["highway"])
+            road_name.setdefault(n, tags.get("name") or tags.get("ref") or f"a {tags['highway']} road")
     nodes = {el["id"]: (el["lat"], el["lon"]) for el in osm["elements"] if el["type"] == "node"}
     heads = {}
     trails = [w for w in osm["elements"] if w["type"] == "way" and w.get("tags", {}).get("highway") in TRAIL_HIGHWAYS
@@ -339,7 +372,7 @@ def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, cl
             for n in comp:
                 comp_size[n] = len(comp)
         d = _haversine(lat, lon, way_ll[:, 0], way_ll[:, 1])
-        near = np.flatnonzero(d <= (0 if on_road else SNAP_M))
+        near = np.flatnonzero(d <= (STREET_SNAP_M if on_road else SNAP_M))
         if len(near):
             biggest = max(comp_size[way_nodes[i]] for i in near)
             i = int(min((i for i in near if comp_size[way_nodes[i]] == biggest), key=lambda i: d[i]))
@@ -354,7 +387,7 @@ def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, cl
                 raise VertmaxxerError(f"Nothing walkable within {SNAP_FAIL_M / 1000:g} km of {lat:.5f}, {lon:.5f}")
             if d[i] > SNAP_WARN_M:
                 print(f"Warning: {lat:.5f}, {lon:.5f} is {d[i]:.0f} m from the nearest usable way; the route starts "
-                      "or ends there instead")
+                      "or ends there instead", file=sys.stderr)  # stderr: quiet runs still show warnings
         anchor_ids.append(int(way_nodes[i]))
 
     count = Counter(n for w in ways for n in w["nodes"])
@@ -635,6 +668,7 @@ def access_spur(edges, start, max_m):
                 H.add_edge(e["u"], e["v"], w=e["length"], k=k)
     bridges = {frozenset(b) for b in nx.bridges(T)}
     core = {n for u, v in T.edges() if frozenset((u, v)) not in bridges for n in (u, v)}
+    core |= {e["u"] for e in edges if e["u"] == e["v"] and not e["roadpt"].any()}  # a loop with one junction
     if start in core or start not in G:
         return [], start
     dist, paths = nx.single_source_dijkstra(G, start, cutoff=max_m, weight="w")
@@ -871,7 +905,10 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
     p2p = ends is not None
     loops, spurs, start_on = topology["loops"], topology["spurs"], topology["start"]
     reuse, retrace_loops = topology["reuse"], topology.get("retrace_loops", False)
-    starts = [n for n in starts if n in idx]
+    keep = [i for i, n in enumerate(starts) if n in idx]
+    starts = [starts[i] for i in keep]
+    if start_cost is not None:
+        start_cost = [start_cost[i] for i in keep]
     if not starts:
         raise VertmaxxerError("No start is reachable within the distance budget.")
     S = [idx[n] for n in starts]

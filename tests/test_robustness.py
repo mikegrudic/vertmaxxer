@@ -498,8 +498,9 @@ def test_cached_download_covering_a_smaller_query_is_reused(monkeypatch, tmp_pat
     monkeypatch.setattr(core.requests, "post", no_network)
     assert core.fetch_osm([(44.001, -72.0)], 3000, True) == data  # inside the first circle
     assert core.fetch_osm([(44.0, -72.0)], 5000, False) == data  # trails only: the download had them
+    assert core.fetch_osm([(44.003, -72.0)], 5000, True) == data  # nudged, within the download's 1 km margin
     with pytest.raises(AssertionError):
-        core.fetch_osm([(44.0, -72.0)], 6000, True)  # bigger: needs a new download
+        core.fetch_osm([(44.0, -72.0)], 7000, True)  # bigger: needs a new download
 
 
 def test_empty_overpass_answers_are_not_cached(monkeypatch, tmp_path):
@@ -524,7 +525,7 @@ def test_end_on_a_street_snaps_to_the_street(offline, capsys):
 def test_far_points_warn_or_fail(offline, capsys):
     offline(osm([(1, PTS, PATH)]))
     run((PTS[0][0] - 300 / M_PER_DEG, -72.0), 4, "out-and-back")
-    assert "m from the nearest usable way" in capsys.readouterr().out
+    assert "m from the nearest usable way" in capsys.readouterr().err
     with pytest.raises(vm.VertmaxxerError, match="within 1 km"):
         run((PTS[0][0] - 2000 / M_PER_DEG, -72.0), 4, "out-and-back")
 
@@ -573,15 +574,16 @@ def test_read_gpx_bad_files(tmp_path):
         vm.read_gpx(tmp_path / "missing.gpx")
 
 
-def test_minimize_doesnt_start_from_the_hilliest_route(offline, monkeypatch):
-    A, approach, net = tri_and_approach()
-    offline(net)
-
-    def seed(*a, **k):
-        raise AssertionError("seeded")
-    monkeypatch.setattr(api, "_seed", seed)
-    with pytest.raises(vm.VertmaxxerError):  # no lollipop fits; the point is that no seed was tried
-        run(approach[-1], 8.5, "lollipop", minimize=True)
+def test_minimize_seeds_the_flattest_route_long_enough():
+    e = lambda u, v, L, var: dict(u=u, v=v, length=L, var=var, road_len=0)
+    edges = [e("S", "A", 1000, 0), e("A", "B", 1500, 90), e("B", "C", 1500, 90), e("C", "A", 1500, 90),
+             e("A", "D", 1500, 10), e("D", "E", 1500, 10), e("E", "A", 1500, 10)]
+    lolli = core.TOPOLOGIES["lollipop"]
+    flat = api._seed(edges, "S", 7000, lolli, 1609, 0.25, min_length=6500, minimize=True)
+    assert list(flat) == [2, 0, 0, 0, 1, 1, 1]
+    hilly = api._seed(edges, "S", 7000, lolli, 1609, 0.25)
+    assert list(hilly) == [2, 1, 1, 1, 0, 0, 0]
+    assert api._seed(edges, "S", 7000, lolli, 1609, 0.25, min_length=6900, minimize=True) is None  # 6.5 km max
 
 
 def test_cli_checks_outputs_before_solving(monkeypatch, tmp_path):
@@ -653,3 +655,91 @@ def test_spurify_output_names(monkeypatch, tmp_path):
 def test_short_legs_fold_into_the_one_before():
     legs = [["Trail A", 1000], ["service", 10], ["footway", 5], ["Trail A", 200], ["Trail B", 500]]
     assert cli._legs(legs) == [["Trail A", 1215], ["Trail B", 500]]
+
+
+# ---------------------------------------------------------------- adversarial round 2
+
+def test_street_start_snaps_to_the_street_network_not_a_cut_off_lane():
+    lane = [(44.0, -72.0002), (44.0, -71.9998)]  # a one-block lane, joined to the rest only by a highway
+    grid = [(44.0006, -72.003 + 0.0005 * i) for i in range(13)]  # a street 67 m north, part of a grid
+    data = osm([(1, lane, {"highway": "service", "name": "Lane"}),
+                (2, [(43.999, -72.0), lane[0]], {"highway": "primary", "name": "Blvd"}),
+                (3, grid, {"highway": "residential", "name": "Park Ave"}),
+                (4, [grid[0], (44.002, -72.003)], {"highway": "residential", "name": "West St"}),
+                (5, [grid[-1], (44.002, -71.997)], {"highway": "residential", "name": "East St"})])
+    _, ids = core.build_graph(data, True, None, [(44.0, -72.0)], snap_roads=(0,))
+    names = {w["tags"]["name"] for w in data["elements"] if w["type"] == "way" and ids[0] in w["nodes"]}
+    assert names == {"Park Ave"}
+
+
+def test_cache_reuse_takes_the_smallest_covering_download_clipped(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "CACHE_DIR", tmp_path)
+    near, far = osm([(1, PTS[:3], PATH)]), osm([(2, [(44.3, -72.0), (44.31, -72.0)], PATH)])
+    small = dict(elements=near["elements"])
+    big = dict(elements=near["elements"] + [dict(e, id=e["id"] + 1000) if e["type"] == "node" else
+                                            dict(e, nodes=[n + 1000 for n in e["nodes"]]) for e in far["elements"]])
+    for name, data, r in (("osm_big", big, 50000.0), ("osm_small", small, 6000.0)):
+        (tmp_path / f"{name}.json").write_text(json.dumps(data))
+        (tmp_path / f"{name}.meta.json").write_text(json.dumps(dict(points=[[44.0, -72.0]], radius=r, roads=True,
+                                                                    way_ids=[])))
+    monkeypatch.setattr(core.requests, "post", lambda *a, **k: (_ for _ in ()).throw(AssertionError("download")))
+    got = core.fetch_osm([(44.0, -72.0)], 3000, True)
+    assert {e["id"] for e in got["elements"] if e["type"] == "way"} == {1}
+    (tmp_path / "osm_small.meta.json").unlink()
+    got = core.fetch_osm([(44.0, -72.0)], 3000, True)  # from the big one, clipped to 3 km
+    assert {e["id"] for e in got["elements"] if e["type"] == "way"} == {1}
+
+
+def test_empty_peaks_answer_is_cached(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(core.requests, "post", lambda *a, **k: Reply({"elements": []}))
+    core._overpass("q", "peaks")
+    assert list(tmp_path.glob("peaks_*.json"))
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_spurify_keeps_the_tracks_direction(spur_offline, reverse):
+    track = spur_offline[::-1] if reverse else spur_offline
+    s = vm.spurify(track, extra_mi=3, time_limit_s=10, workers=2)
+    along = np.r_[0, np.cumsum(core._haversine(track[:-1, 0], track[:-1, 1], track[1:, 0], track[1:, 1]))]
+    q = track[np.searchsorted(along, along[-1] / 4)]  # the track's quarter-way point
+    i = np.argmin(core._haversine(*q, s.route.lat, s.route.lon))
+    assert s.route.dist[i] / s.route.dist[-1] < 0.5  # comes early in the output too, not late (reversed)
+
+
+def test_two_loop_shapes_get_longer_by_default(offline, monkeypatch):
+    offline(osm([(1, PTS[:21], PATH)]))
+    seen = []
+
+    def solve(edges, starts, ends, budget, topology, min_loop, time_limit, *a, **k):
+        seen.append(time_limit)
+        raise vm.VertmaxxerError("stop")
+    monkeypatch.setattr(core, "solve", solve)
+    for shape in ("figure-8", "loop"):
+        with pytest.raises(vm.VertmaxxerError):
+            vm.find_route(PTS[0], 5, shape, workers=2)
+    assert seen == [600.0, 120.0]
+
+
+def test_negative_coordinates_after_start():
+    assert cli._attach_negative(["--start", "-73.9,41.4", "--distance", "5"]) == ["--start=-73.9,41.4", "--distance", "5"]
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--start", "-73.96568,41.42698", "--distance", "5"])
+    assert e.value.code == 2  # "check the order", not "expected one argument"
+
+
+def test_api_niceties():
+    import inspect
+    assert "quiet" in inspect.signature(vm.find_route).parameters
+    assert api._points(["42.03545,-74.35961", "41.42698,-73.96568"]) == [(42.03545, -74.35961), (41.42698, -73.96568)]
+    with pytest.raises(vm.OptionError, match="outside the US"):
+        api._points((51.18, -115.57))  # Banff
+
+
+def test_loop_from_a_stub_walks_out_to_the_loop(offline):
+    """A start at the end of an approach trail: the loop starts where the approach meets it."""
+    A, approach, net = tri_and_approach()
+    offline(net)
+    r = run(approach[20], 5, "loop")  # 1 km down the approach
+    assert r.shape == "loop" and "access path" in r.details
+    assert core._haversine(r.lat[0], r.lon[0], *approach[20]) < 5 and r.closed

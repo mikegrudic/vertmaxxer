@@ -35,7 +35,7 @@ def _print_route(r):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="vertmaxxer", description=core.__doc__,
+    p = argparse.ArgumentParser(prog="vertmaxxer", description=core.__doc__, allow_abbrev=False,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--start", type=_latlon, action="append", required=True,
                    help="lat,lon of a trailhead; repeat to let the solver choose among several")
@@ -88,8 +88,8 @@ def main(argv=None):
     a = p.parse_args(argv)
 
     try:
-        r = find_route(a.start, a.distance, a.topology, time_h=a.time, pace=a.pace, gap=a.gap, end=a.end, end_trailheads=a.end_trailheads,
-                       min_end_dist_mi=a.min_end_dist, any_end=a.any_end, max_road_fraction=a.max_road_fraction,
+        r = find_route(a.start, a.distance, a.topology, time_h=a.time, pace=a.pace, gap=a.gap, end=a.end,
+                       end_trailheads=a.end_trailheads, min_end_dist_mi=a.min_end_dist, any_end=a.any_end, max_road_fraction=a.max_road_fraction,
                        trailhead_roads_m=a.trailhead_roads, roads=a.roads, roads_only=a.roads_only,
                        paved_only=a.paved_only, road_time_frac=a.road_time_frac, ways=a.ways, closures=a.closures,
                        minimize=a.minimize, min_loop_mi=a.min_loop, min_loop_frac=a.min_loop_frac, max_sac=a.max_sac,
@@ -117,7 +117,7 @@ def main(argv=None):
 
 def spurify_main(argv=None):
     p = argparse.ArgumentParser(
-        prog="vertmaxxer-spurify", formatter_class=argparse.RawDescriptionHelpFormatter,
+        prog="vertmaxxer-spurify", formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False,
         description="Add out-and-back side trips to named summits to a route you like, keeping the route itself.\n"
                     "Side trips turn around only at peaks (or where the route already turns around).")
     p.add_argument("gpx")
@@ -125,14 +125,14 @@ def spurify_main(argv=None):
     g.add_argument("--extra", type=float, help="miles that may be added")
     g.add_argument("--budget", type=float, help="total miles")
     p.add_argument("-o", "--output", help="GPX to write (default ROUTE_spurred.gpx)")
-    p.add_argument("--time", type=float, default=60, help="solver seconds (default 60)")
+    p.add_argument("--time-limit", type=float, default=60, help="solver time limit (s, default 60)")
     p.add_argument("--workers", type=int, default=min(8, os.cpu_count()))
     p.add_argument("--match-m", type=float, default=15, help="how close the track must follow a trail (m)")
     p.add_argument("--summit-m", type=float, default=60, help="how close a trail must pass a peak (m)")
     a = p.parse_args(argv)
 
     try:
-        s = spurify(a.gpx, a.extra, a.budget, time_limit_s=a.time, workers=a.workers, match_m=a.match_m,
+        s = spurify(a.gpx, a.extra, a.budget, time_limit_s=a.time_limit, workers=a.workers, match_m=a.match_m,
                     summit_m=a.summit_m)
     except VertmaxxerError as err:
         raise SystemExit(str(err))

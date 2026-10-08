@@ -1,0 +1,166 @@
+# vertmaxxer
+
+Give it a starting point, a distance and a route shape. It finds the route with the most climbing on the
+OpenStreetMap trail network, and writes a GPX file.
+
+```
+vertmaxxer --start 41.42698,-73.96568 --distance 15 --topology lollipop
+```
+
+Elevation comes from USGS 3DEP, so it works in the US only. The solver uses OR-Tools CP-SAT; the model is
+described at the top of `src/vertmaxxer/core.py`.
+
+## Install
+
+```
+pip install "vertmaxxer[plot] @ git+https://github.com/mikegrudic/vertmaxxer"
+```
+
+or, from a clone, `pip install -e ".[plot,test]"`. Python 3.10 or later; `[plot]` adds matplotlib for `--plot`.
+
+Trail and elevation downloads are cached in `~/.cache/vertmaxxer` (set `VERTMAXXER_CACHE` to move it), so a second
+run near the same start is much faster.
+
+## Vertmaxx a route
+
+1. **Get the start as `lat,lon`.** In Google Maps, right-click the trailhead and click the coordinates to copy
+   them. Use the parking lot or trailhead; the route starts from the nearest trail.
+2. **Pick a distance** in miles. This is a maximum; the route can come in shorter if the extra distance would add
+   no climbing.
+3. **Pick a shape:**
+
+   | `--topology`   | Route |
+   |----------------|-------|
+   | `loop`         | One loop, nothing repeated |
+   | `out-and-back` | Out and back along the same trail |
+   | `lollipop`     | Out on a stem, around a loop, back down the stem (the default) |
+   | `figure-8`     | Two loops through one crossing point, nothing repeated |
+   | `dumbbell`     | A loop, a repeated connector, a second loop, then back |
+   | `traverse`     | Point to point; needs `--end LAT,LON` or `--end-trailheads` |
+   | `any`          | Whatever climbs most, as long as no trail is run more than twice |
+
+4. **Run it:**
+
+   ```
+   vertmaxxer --start 44.21787,-71.41128 --distance 20 --topology lollipop \
+       -o crawford.gpx --plot crawford.png
+   ```
+
+   It prints the shape, the distance, the gain and a turn-by-turn list of trails, then writes the GPX and, with
+   `--plot`, a map and elevation profile.
+
+   Another: the Burroughs Range loop from Woodland Valley, over Wittenberg, Cornell and Slide, with a walk on
+   Oliverea Road back to the Phoenicia-East Branch Trail:
+
+   ```
+   vertmaxxer --start 42.03545,-74.35961 --distance 16 --topology loop
+   ```
+
+### The rules it follows
+
+By default it plays by the same rules as the published survey:
+
+- **Trails**, with up to 10% of the distance on roads (`--max-road-fraction`), for walks between trailheads.
+  Road crossings of up to 50 m and the roads within 400 m of the start (its parking lots and access roads) don't
+  count toward that. Highways (OSM primary and trunk) can be crossed but not followed.
+- **Closed segments** bundled with the package (`src/vertmaxxer/data/closures/`) are avoided: closed trails and roads (such as NY 9D at Breakneck), and abandoned
+  trails still in OSM.
+- **Traverses** with `--end-trailheads` don't end on the Mount Washington Auto Road, at the Mount Washington summit,
+  or on Breakneck Road (NY 9D).
+- **Loops** are at least 1 mi and a quarter of the route long, and a traverse ends at least 1 mi from its start.
+
+### Useful options
+
+| Option | What it does |
+|--------|--------------|
+| `-o FILE.gpx` | Where to write the route (default `vertmaxxer.gpx`) |
+| `--plot FILE.png` | Also draw a map and elevation profile |
+| `--roads` | Allow roads as well as trails, any amount |
+| `--roads-only` | Roads only, paved or dirt: no trails, tracks, driveways or parking aisles. Highways (OSM primary and trunk) can be crossed but not followed |
+| `--paved-only` | Leave out roads tagged as unpaved (gravel, dirt, ...). Many roads have no surface tag; those count as paved |
+| `--ways FILE` | Add or exclude particular OSM ways (see Road runs below) |
+| `--minimize` | Find the flattest route instead, covering at least 98% of `--distance` |
+| `--max-road-fraction F` | At most this share of the distance on roads (default 0.1; 0 for trails only) |
+| `--trailhead-roads M` | Walkable roads around the start, in meters (default 400; 0 for none) |
+| `--any-end` | Allow traverses to end on the Mount Washington Auto Road, at its summit, or on Breakneck Road |
+| `--time-limit S` | Seconds to search (default 120). Give long routes, or `figure-8`, `dumbbell` and `any`, 600 or more |
+| `--end LAT,LON` | Finish here (with `--topology traverse`) |
+| `--end-trailheads` | Finish at whichever trailhead gives the most gain (with `--topology traverse`) |
+| `--closures FILE` | Also avoid the closed segments listed in FILE (format as in `src/vertmaxxer/data/closures/`) |
+| `--max-sac N` | Skip trails rated harder than SAC grade TN (1-6) |
+| `--start` again | Give several starts; the solver uses whichever is best |
+
+`vertmaxxer --help` lists the rest.
+
+### Reading the result
+
+- **Gain** is computed from elevation smoothed over about 50 m, which removes noise from the elevation data.
+  It reads about 9% lower than CalTopo. The figure in parentheses is the gain without smoothing.
+- **The search usually runs until the time limit** rather than proving its route is the best possible. A longer
+  `--time-limit` sometimes finds more.
+- **If it prints "requested X but the route is a Y"**, the best route it found has a simpler shape, for example
+  a lollipop whose loop shrank away. Try another shape, or a different distance.
+
+## Road runs
+
+`--roads-only` plans a run on streets. OSM sorts ways by type, not surface: `highway=track` (most forest and farm
+roads) counts as a trail and is left out, while a gravel town road counts as a road and is kept unless you add
+`--paved-only`.
+
+A `--ways` file fine-tunes the network: `include` adds ways of any type (a cemetery lane, a pedestrian tunnel), and
+`exclude` drops ways (a private drive). Way ids come from openstreetmap.org: click a way and read the id from the URL.
+Dead ends of included paths are joined to the nearest street within 30 m, since the graph leaves out sidewalks.
+`examples/cold_spring_road_runs.json` is the Cold Spring setup: the cemetery lanes and the Main Street tunnel, without
+the private drives.
+
+```
+# the hilliest 10K loop from the Cold Spring bandstand, then the flattest
+vertmaxxer --start 41.41602,-73.96122 --roads-only --ways examples/cold_spring_road_runs.json \
+    --distance 6.214 --topology loop -o cs_hilly.gpx
+vertmaxxer --start 41.41602,-73.96122 --roads-only --ways examples/cold_spring_road_runs.json \
+    --distance 6.214 --topology loop --minimize -o cs_flat.gpx
+```
+
+## Add summit side trips to a route
+
+To add out-and-back side trips to summits to a route you already have (from this tool, CalTopo or a watch),
+use `spurify.py`. It keeps your route and adds trips that turn around only at named peaks:
+
+```
+vertmaxxer-spurify my_route.gpx --extra 3        # up to 3 more miles
+vertmaxxer-spurify my_route.gpx --budget 30      # or a total distance
+```
+
+It writes `my_route_spurred.gpx` (or `-o FILE`) and prints a table of the side trips added, with their length, gain and
+summits. If it warns that the matched length is off, which can happen with a noisy watch track, raise
+`--match-m`.
+
+## Python API
+
+The command-line tools are thin wrappers over two functions:
+
+```python
+import vertmaxxer as vm
+
+r = vm.find_route((42.03545, -74.35961), 16, "loop")  # same options as the CLI, as keyword arguments
+print(r.shape, r.distance_mi, r.gain_ft, r.proven)
+for name, meters in r.legs:
+    print(name, meters)
+r.write_gpx("burroughs.gpx")
+r.plot("burroughs.png")  # needs matplotlib
+
+s = vm.spurify("my_route.gpx", extra_mi=3)
+print(s.base_gain_ft, s.route.gain_ft, s.side_trips)
+```
+
+`find_route` and `spurify` raise `vertmaxxer.VertmaxxerError` when no route fits or a data source fails, and
+`ValueError` for inconsistent options.
+
+## When it fails
+
+| Message | What to do |
+|---------|------------|
+| `All Overpass servers failed` | The OpenStreetMap servers are busy. Try again in a few minutes |
+| HTTP 504 from the USGS elevation service | Add `--dem terrarium` to use AWS terrain tiles instead |
+| `No feasible route found` | No route of that shape fits the distance. A loop may need a longer road walk between trailheads: raise `--max-road-fraction`. Otherwise try more miles or another shape |
+| A start snapped hundreds of meters away | The point isn't near a mapped trail. Move it onto the trail |

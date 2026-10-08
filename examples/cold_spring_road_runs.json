@@ -1,0 +1,29 @@
+{
+ "note": "Cold Spring road runs (use with --roads-only): the Cold Spring Cemetery lanes and the pedestrian tunnel under the tracks at the foot of Main Street; private drives excluded (Manitou School off 9D, Moffatt Road to Healy Road).",
+ "include": [
+  295688401,
+  295688402,
+  295688403,
+  295688405,
+  295688407,
+  295688408,
+  295688409,
+  295688410,
+  295688411,
+  329378033,
+  1165285748,
+  1287157241,
+  1287153001,
+  1287153000,
+  1287153031,
+  1287153032
+ ],
+ "exclude": [
+  329378036,
+  329378037,
+  795381392,
+  329378046,
+  192418583,
+  192418575
+ ]
+}

@@ -7,7 +7,7 @@ OpenStreetMap trail network, and writes a GPX file.
 vertmaxxer --start 42.03545,-74.35961 --distance 16 --topology loop
 ```
 
-Elevation comes from USGS 3DEP, which covers the US; elsewhere, add `--dem terrarium` (AWS terrain tiles, worldwide). The solver uses OR-Tools CP-SAT; the model is
+Elevation comes from USGS 3DEP in the US and from AWS terrain tiles elsewhere (worldwide, built from national data where it's fine-grained and ~30 m SRTM otherwise); `--dem` picks one. The solver uses OR-Tools CP-SAT; the model is
 described at the top of `src/vertmaxxer/core.py`.
 
 ## Install
@@ -27,7 +27,7 @@ outside the area already downloaded, fetches again.
 1. **Get the start as `lat,lon`.** In Google Maps, right-click the spot and click the coordinates to copy them.
    Maps copies them with a space after the comma: delete it, or quote the pair (`--start "42.03545, -74.35961"`).
    The route starts on the nearest trail or street to that point. From a house, it walks the streets to the
-   trails: the first 400 m are free, and the rest counts toward `--max-road-fraction`. To start on a particular
+   nearest trails; that walk counts toward the distance but not toward `--max-road-fraction`. To start on a particular
    trail, put the point on it.
 2. **Pick a distance** in miles. This is a maximum; the route can come in shorter if the extra distance would add
    no climbing.
@@ -99,6 +99,7 @@ By default it plays by the same rules as the published survey:
 | `--paved-only` | Leave out roads tagged as unpaved (gravel, dirt, ...). Many roads have no surface tag; those count as paved |
 | `--ways FILE` | Add or exclude particular OSM ways (see Road runs below) |
 | `--minimize` | Find the flattest route instead, covering at least 98% of `--distance`. Works well for loops and road runs; a lollipop in a big trail network may find no route in the time limit |
+| `--primary-roads` | Allow running along primary roads (often a town's main street), not just across them |
 | `--max-road-fraction F` | At most this share of the distance on roads (default 0.1; 0 for trails only) |
 | `--trailhead-roads M` | Walkable roads around the start, in meters (default 400; 0 for none) |
 | `--any-end` | Allow traverses to end on the Mount Washington Auto Road, at its summit, or on Breakneck Road |

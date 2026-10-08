@@ -118,6 +118,8 @@ def _print_route(r, u=_Units(False)):
     print(f"\nShape: {r.shape} ({r.details})")
     if r.end:
         print(f"Ends at {r.end[2]} ({r.end[0]:.5f}, {r.end[1]:.5f})")
+    elif not r.closed:
+        print(f"Ends at {r.lat[-1]:.5f}, {r.lon[-1]:.5f}")
     print(f"Distance {u.dist(r.distance_mi):.2f} {u.d}, gain {u.gain(r.gain_ft):,.0f} {u.z} "
           f"(unsmoothed {u.gain(r.gain_raw_ft):,.0f} {u.z}), {u.gain(r.gain_ft) / u.dist(r.distance_mi):,.0f} "
           f"{u.z}/{u.d}{'; optimal' if r.proven else ''}")
@@ -125,11 +127,15 @@ def _print_route(r, u=_Units(False)):
         print(f"  {u.dist(length / MI_TO_M):5.2f} {u.d}  {name}")
 
 
-def _legs(legs, min_m=32.0):
-    """The turn list with legs under ``min_m`` (connectors, lot aisles) folded into the leg before them."""
+GENERIC = set(core.TRAIL_HIGHWAYS + core.ROAD_HIGHWAYS) | {"gap in map data", "sidewalk"}  # ways with no name
+
+
+def _legs(legs, min_m=32.0, min_unnamed_m=80.0):
+    """The turn list with legs under ``min_m`` (or unnamed ones under ``min_unnamed_m``: lot aisles, connectors,
+    mapping gaps) folded into the leg before them."""
     out = []
     for name, length in legs:
-        if out and (length < min_m or out[-1][0] == name):
+        if out and (length < (min_unnamed_m if name in GENERIC else min_m) or out[-1][0] == name):
             out[-1][1] += length
         else:
             out.append([name, length])
@@ -178,6 +184,8 @@ def main(argv=None):
                         "on Breakneck Road")
     p.add_argument("--marked-only", action="store_true",
                    help="skip herd paths and other informal or unmarked ways (shown as \"(unmarked)\" otherwise)")
+    p.add_argument("--primary-roads", action="store_true",
+                   help="allow running along primary roads (often a town's main street), not just across them")
     p.add_argument("--max-road-fraction", type=float, metavar="F",
                    help="at most this share of the route's distance on roads, e.g. a road walk between trailheads "
                         "(default 0.1; 0 for trails only). Road crossings and the start's own roads don't count")
@@ -199,7 +207,8 @@ def main(argv=None):
     p.add_argument("--min-loop-frac", type=float, default=0.25, help="min length of each loop, as a fraction of the route")
     p.add_argument("--max-sac", type=int, choices=range(1, 7), metavar="1-6",
                    help="exclude trails above this SAC scale grade (T1-T6)")
-    p.add_argument("--dem", choices=["3dep", "terrarium"], default="3dep", help="elevation source")
+    p.add_argument("--dem", choices=["auto", "3dep", "terrarium"], default="auto",
+                   help="elevation: USGS 3DEP (US) or AWS terrain tiles (worldwide); default: 3DEP in the US")
     p.add_argument("--smooth", type=float, default=50.0, help="elevation smoothing e-folding length (m)")
     p.add_argument("--seg-max", type=float, default=500.0, help="turnaround resolution when spurs are allowed (m)")
     p.add_argument("--time-limit", type=float,
@@ -231,7 +240,7 @@ def main(argv=None):
                        gap=u.per_mi(a.gap), end=a.end, end_trailheads=a.end_trailheads,
                        min_end_dist_mi=1.0 if a.min_end_dist is None else u.to_mi(a.min_end_dist), any_end=a.any_end,
                        max_road_fraction=0.1 if a.max_road_fraction is None else a.max_road_fraction,
-                       marked_only=a.marked_only,
+                       marked_only=a.marked_only, primary_roads=a.primary_roads,
                        trailhead_roads_m=a.trailhead_roads, roads=a.roads, roads_only=a.roads_only,
                        paved_only=a.paved_only, road_time_frac=a.road_time_frac, ways=a.ways, closures=a.closures,
                        minimize=a.minimize, min_loop_mi=1.0 if a.min_loop is None else u.to_mi(a.min_loop),
@@ -244,6 +253,8 @@ def main(argv=None):
     except VertmaxxerError as err:
         raise SystemExit(str(err))
     _print_route(r, u)
+    if len(a.start) > 1:
+        print(f"Starts at {r.lat[0]:.5f}, {r.lon[0]:.5f}")
     if a.gap:
         gap = u.per_mi(a.gap)
         back = f"; run in reverse, {_fmt(r.flat_mi(True) * gap / 60)}" if r.closed else ""
@@ -273,7 +284,8 @@ def spurify_main(argv=None):
     p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
     p.add_argument("--match-m", type=float, default=15, help="how close the track must follow a trail (m)")
     p.add_argument("--summit-m", type=float, default=60, help="how close a trail must pass a peak (m)")
-    p.add_argument("--dem", choices=["3dep", "terrarium"], default="3dep", help="elevation source")
+    p.add_argument("--dem", choices=["auto", "3dep", "terrarium"], default="auto",
+                   help="elevation: USGS 3DEP (US) or AWS terrain tiles (worldwide); default: 3DEP in the US")
     _add_units(p)
     a = p.parse_args(argv)
     _line_buffered()
@@ -290,7 +302,7 @@ def spurify_main(argv=None):
         raise SystemExit(str(err))
     _write(lambda path: s.route.write_gpx(path, os.path.splitext(os.path.basename(path))[0]), out)
 
-    print(f"\n{'Leaves route':>12s}  {'Out and back':>12s}  {'Gain':>8s}  {u.z + '/' + u.d:>6s}  Summits")
+    print(f"\n{'Leaves track':>12s}  {'Out and back':>12s}  {'Gain':>8s}  {u.z + '/' + u.d:>6s}  Summits")
     for t in s.side_trips:
         names = ", ".join(t.summits) or "(connector, no summit)"
         print(f"{u.dist(t.leaves_at_mi):9.2f} {u.d}  {u.dist(t.length_mi):9.2f} {u.d}  {u.gain(t.gain_ft):6,.0f} {u.z:2s}  "

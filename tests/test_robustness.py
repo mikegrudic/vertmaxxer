@@ -740,7 +740,7 @@ def test_api_niceties():
     assert "quiet" in inspect.signature(vm.find_route).parameters
     assert api._points(["42.03545,-74.35961", "41.42698,-73.96568"]) == [(42.03545, -74.35961), (41.42698, -73.96568)]
     with pytest.raises(vm.OptionError, match="outside the US"):
-        api._points((51.18, -115.57))  # Banff
+        api._points((51.18, -115.57), "3dep")  # Banff, with 3DEP asked for
 
 
 def test_loop_from_a_stub_walks_out_to_the_loop(offline):
@@ -771,7 +771,8 @@ def test_metric_inputs_reach_the_api_in_miles(monkeypatch):
 
 def test_metric_route_output(capsys):
     r = type("R", (), dict(shape="loop", details="10.00 km", end=None, distance_mi=10 / 1.609344, gain_ft=1000 * core.M_TO_FT,
-                           gain_raw_ft=1100 * core.M_TO_FT, proven=True, legs=[["Long Trail", 10000.0]]))()
+                           gain_raw_ft=1100 * core.M_TO_FT, proven=True, legs=[["Long Trail", 10000.0]],
+                           closed=True))()
     cli._print_route(r, cli._Units(True))
     out = capsys.readouterr().out
     assert "Distance 10.00 km, gain 1,000 m (unsmoothed 1,100 m), 100 m/km" in out and "10.00 km  Long Trail" in out
@@ -813,3 +814,119 @@ def test_metric_setting_sticks_until_imperial(monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["--start", "44,-72", "--distance", "10", "--metric", "--imperial"])
     assert e.value.code == 2
+
+
+def test_start_at_a_street_corner_shared_with_a_path_stays_there(offline, capsys):
+    """A crosswalk stub shares the corner node with the street; a bigger park path network lies 200 m off. The
+    start stays at the corner."""
+    corner = (44.0, -72.0)
+    street = [(44.0, -72.002), corner, (44.0, -71.998)]
+    stub = [corner, (43.9999, -72.0)]
+    park = [(44.0018 + 0.0002 * i, -72.0) for i in range(20)]
+    offline(osm([(1, street, {"highway": "residential", "name": "21st St"}), (2, stub, {"highway": "footway"}),
+                 (3, park, {"highway": "footway", "name": "Park Path"}),
+                 (4, [(44.0, -71.998), park[0]], {"highway": "residential", "name": "Ave"})]))
+    try:  # only the snap matters here
+        run(corner, 0.05, "out-and-back", roads=True)
+    except vm.VertmaxxerError:
+        pass
+    assert "snapped 0 m" in capsys.readouterr().out
+
+
+
+# ---------------------------------------------------------------- adversarial round 3
+
+def town(main_primary=True):
+    """Two blocks of streets either side of a main street, joined only across it."""
+    tags = {"highway": "primary" if main_primary else "residential", "name": "Main St"}
+    main = [(44.0, -72.006 + 0.001 * i) for i in range(13)]
+    ways = [(1, main, tags)]
+    for k, (side, i, j) in enumerate(((1, 2, 10), (-1, 3, 9))):  # the blocks meet Main St at different corners
+        a, b = (44.0 + side * 0.004, main[i][1]), (44.0 + side * 0.004, main[j][1])
+        ways += [(10 + k, [main[i], a], {"highway": "residential", "name": f"West {k}"}),
+                 (20 + k, [a, b], {"highway": "residential", "name": f"Back {k}"}),
+                 (30 + k, [b, main[j]], {"highway": "residential", "name": f"East {k}"})]
+    return osm(ways)
+
+
+def test_road_runs_along_a_primary_main_street(offline):
+    offline(town())
+    with pytest.raises(vm.VertmaxxerError, match="--primary-roads"):
+        run((44.004, -72.0), 2.5, "loop", roads_only=True)
+    assert run((44.004, -72.0), 2.5, "loop", roads_only=True, primary_roads=True).shape == "loop"
+
+
+def test_walk_from_town_to_the_trails_is_free_of_the_road_cap(offline):
+    """A 3 km trail loop at the top of a 1 km approach trail, 1.5 km of street from the start: the street is the
+    way to the trails, so it doesn't count against the 10% road cap (it's half the road the route would allow)."""
+    A = (44.0, -72.0)
+    B = (A[0] + 1000 / M_PER_DEG, A[1])
+    C = (A[0] + 500 / M_PER_DEG, A[1] + 1000 / (M_PER_DEG * np.cos(np.radians(44))))
+    seg = lambda p, q: [(p[0] + f * (q[0] - p[0]), p[1] + f * (q[1] - p[1])) for f in np.linspace(0, 1, 21)]
+    approach = line(*A, 1, south=True)
+    street = line(*approach[-1], 1.5, south=True)
+    offline(osm([(1, seg(A, B) + seg(B, C)[1:] + seg(C, A)[1:], {"highway": "path", "name": "Triangle"}),
+                 (2, approach, {"highway": "path", "name": "Approach"}),
+                 (3, street, {"highway": "residential", "name": "Village Rd"})]))
+    r = run(street[-1], 5.5, "lollipop")  # 2 x (1.5 + 1) + 3.2 = 8.2 km; 3 km of it street
+    assert r.shape == "lollipop" and any(n == "Village Rd" for n, _ in r.legs)
+
+
+def test_access_path_counts_toward_road_cap_and_gain(offline, capsys):
+    e = lambda u, v, L, road=0.0: dict(u=u, v=v, length=L, var=10.0, road_len=road, gap=(L, L), z=np.array([0.0, 0.0]))
+    edges = [e("A", "B", 1000), e("B", "C", 1000), e("C", "A", 1000)]
+    tri = core.TOPOLOGIES["loop"]
+    ok = core.solve(edges, ["A"], None, 6000, tri, 0, 10, 1, False, max_road_frac=0.1, start_cost=[2000],
+                    start_road=[0.0])
+    assert ok is not None
+    with pytest.raises(vm.VertmaxxerError):  # 2 km of road in a 5 km route: over a 10% cap
+        core.solve(edges, ["A"], None, 6000, tri, 0, 10, 1, False, max_road_frac=0.1, start_cost=[2000],
+                   start_road=[2000.0])
+    capsys.readouterr()
+    core.solve(edges, ["A"], None, 6000, tri, 0, 10, 1, False, start_cost=[2000], start_gain=[100.0])
+    final = [ln for ln in capsys.readouterr().out.splitlines() if "optimal:" in ln][-1]
+    assert "gain 377 ft" in final  # 15 m round the loop + 100 m out and back = 115 m
+
+
+def test_no_network_says_so_quickly(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(core, "_DEAD_MIRRORS", set())
+    calls = []
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    def down(*a, **k):
+        calls.append(1)
+        raise core.requests.ConnectionError("no route to host")
+    monkeypatch.setattr(core.requests, "post", down)
+    with pytest.raises(vm.VertmaxxerError, match="internet connection"):
+        core._overpass("q", "osm")
+    assert len(calls) == len(core.OVERPASS_URLS)
+
+
+def test_us_territories_accepted():
+    assert api._points([(18.34, -64.93), (13.44, 144.79)])  # USVI, Guam
+
+
+def test_unnamed_legs_fold():
+    legs = [["Long Trail", 2000], ["service", 60], ["gap in map data", 5], ["footway", 70], ["Ridge Trail", 50]]
+    assert cli._legs(legs) == [["Long Trail", 2135], ["Ridge Trail", 50]]
+
+
+
+def test_elevation_source_outside_the_us():
+    assert api._dem_for([(42.0, -74.0)], "auto") == "3dep"
+    assert api._dem_for([(46.56, 8.0)], "auto") == "terrarium"  # the Alps
+    assert api._points((46.56, 8.0), "auto") == [(46.56, 8.0)]
+    with pytest.raises(vm.OptionError, match="swap"):
+        api._points((-73.96568, 41.42698), "auto")
+
+
+def test_traffic_island_doesnt_count_as_a_trail():
+    p = (44.0, -72.0)
+    island = [(44.0001, -72.0001), (44.0001, -72.0)]  # 8 m of footway in the street, 11 m away
+    street = [(44.0, -72.0003), (44.00012, -71.99995)]  # nearest node 13 m away
+    park = [(44.002 + 0.0002 * i, -72.0) for i in range(20)]  # a real path network 220 m off
+    data = osm([(1, island, {"highway": "footway", "footway": "traffic_island"}),
+                (2, street, {"highway": "secondary", "name": "5th Avenue"}),
+                (3, park, {"highway": "footway", "name": "Park Path"})])
+    assert api._nearer_street(data, p)

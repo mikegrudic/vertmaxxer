@@ -240,12 +240,13 @@ def _overpass(query, prefix):
     """Run an Overpass query, trying each mirror, with the result cached on disk."""
     def fetch():
         print("Querying Overpass...")
-        timeouts = 0
+        timeouts, answered = 0, False
         for attempt, wait in enumerate(OVERPASS_WAITS):
             live = [u for u in OVERPASS_URLS if u not in _DEAD_MIRRORS] or OVERPASS_URLS
             url = live[attempt % len(live)]
             try:
                 r = requests.post(url, data={"data": query}, headers=HEADERS, timeout=360)
+                answered = True
                 if r.status_code in (403, 500) and url != OVERPASS_URLS[0]:
                     _DEAD_MIRRORS.add(url)
                 if r.status_code == 400:  # the query itself is bad; retrying won't help
@@ -265,7 +266,9 @@ def _overpass(query, prefix):
                     raise requests.RequestException(remark)
                 return data
             except (requests.RequestException, ValueError) as err:
-                print(f"  {url}: {err}; retrying in {wait} s")
+                if not answered and attempt + 1 >= len(live) and isinstance(err, requests.ConnectionError):
+                    raise VertmaxxerError("Can't reach the Overpass servers: check the internet connection")
+                print(f"  {url}: {str(err)[:160]}; retrying in {wait} s")
                 time.sleep(wait)
         raise VertmaxxerError("All Overpass servers failed; try again later.")
 
@@ -886,7 +889,8 @@ def subdivide(edges, seg_max):
 
 def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, verbose, hint=None,
           min_loop_frac=0.0, road_time_frac=None, start_cost=None, minimize=False, min_length=0.0,
-          no_turnarounds=False, turnaround_ok=(), max_road_frac=None, turn_penalty=0.0):
+          no_turnarounds=False, turnaround_ok=(), max_road_frac=None, turn_penalty=0.0, start_road=None,
+          start_gain=None):
     """Return (traversal count per edge, start node, end node, proven optimal) for the best route found.
 
     ``topology`` is a TOPOLOGIES entry. Each loop must be at least ``min_loop`` (m) long and at least
@@ -897,7 +901,8 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
 
     An edge's optional ``cost`` (m) replaces its length in the budget, e.g. grade-adjusted time as flat distance.
 
-    ``start_cost`` (m per start) is added to the distance when that start is used, e.g. the walk to it. Edges
+    ``start_cost`` (m per start) is added to the distance when that start is used, e.g. the walk to it, with
+    ``start_road`` (m) of road toward the road cap and ``start_gain`` (m) of climbing. Edges
     marked ``frozen`` can't be used; an edge with ``link`` = i is run exactly once when start i is used and never
     otherwise (e.g. a walk out via one trailhead and back via another). With ``minimize`` the route climbing the
     least is found instead, at least ``min_length`` (m) long.
@@ -921,8 +926,8 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
     reuse, retrace_loops = topology["reuse"], topology.get("retrace_loops", False)
     keep = [i for i, n in enumerate(starts) if n in idx]
     starts = [starts[i] for i in keep]
-    if start_cost is not None:
-        start_cost = [start_cost[i] for i in keep]
+    start_cost, start_road, start_gain = ([x[i] for i in keep] if x is not None else None
+                                          for x in (start_cost, start_road, start_gain))
     if not starts:
         raise VertmaxxerError("No start is reachable within the distance budget.")
     S = [idx[n] for n in starts]
@@ -1096,13 +1101,16 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
     if max_road_frac is not None:
         rl = [round(e["road_len"]) for e in edges]
         pct = round(100 * max_road_frac)
-        md.Add(100 * sum(rl[e] * (a[e] + 2 * b[e]) for e in range(E))
-               <= pct * sum(L[e] * (a[e] + 2 * b[e]) for e in range(E)))
+        extra_road = sum(round(r) * s[i] for i, r in enumerate(start_road)) if start_road is not None else 0
+        md.Add(100 * (sum(rl[e] * (a[e] + 2 * b[e]) for e in range(E)) + extra_road)
+               <= pct * (sum(L[e] * (a[e] + 2 * b[e]) for e in range(E)) + extra))
     if spurs is not None:
         md.Add(sum(leaves) <= spurs)
 
     # Objective in units of 2 * gain in decimeters.
     objective = sum(dz[e] * (a[e] + 2 * b[e]) for e in range(E))
+    if start_gain is not None:  # out and back: every meter up or down is climbed once
+        objective += sum(round(20 * g) * s[i] for i, g in enumerate(start_gain))
     if p2p:
         objective += sum(z_node[n] * t[j] for j, n in enumerate(T)) - sum(z_node[n] * s[i] for i, n in enumerate(S))
     if turn_penalty:

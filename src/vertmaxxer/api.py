@@ -1,13 +1,15 @@
 """Python API: find a route, or add summit side trips to one. The command-line tools are thin wrappers over these."""
 import json
+import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 
 import networkx as nx
 import numpy as np
 
 from . import core
-from .core import MI_TO_M, M_TO_FT, VertmaxxerError
+from .core import MI_TO_M, M_TO_FT, OptionError, VertmaxxerError
 
 
 @dataclass
@@ -79,13 +81,42 @@ def _nearer_street(osm, point):
     return best[True] < best[False]
 
 
+TURN_PENALTY_M = 9.144  # 30 ft: a turnaround must climb at least this much to be worth it
+
+
+def _collapse_parallel(edges, short_m=100.0):
+    """Of ways joining the same two points, all shorter than ``short_m``, only the shortest: two footways side by
+    side are one way, not a mini-loop (or out-and-back) to pick up a few feet."""
+    pairs = {}
+    for e in edges:
+        pairs.setdefault(frozenset((e["u"], e["v"])), []).append(e)
+    out = []
+    for es in pairs.values():
+        out += [min(es, key=lambda e: e["length"])] if max(e["length"] for e in es) < short_m else es
+    return out
+
+
+def _tidy(edges, keep, short_m=100.0):
+    """The network without clutter that routes turning back anywhere would exploit: parallel short ways, and
+    dead-end road stubs shorter than ``short_m`` (alleys, lot entrances; repeatedly, so a short street that ends in
+    stubs goes too)."""
+    edges = _collapse_parallel(edges, short_m)
+    while True:
+        deg = Counter(n for e in edges if e["u"] != e["v"] for n in (e["u"], e["v"]))
+        stubs = {id(e) for e in edges if e["road"] and e["length"] < short_m
+                 and any(deg[n] == 1 and n not in keep for n in (e["u"], e["v"]))}
+        if not stubs:
+            return edges
+        edges = [e for e in edges if id(e) not in stubs]
+
+
 def _points(p):
     """One (lat, lon) or a list of them, as a list."""
     return [tuple(map(float, p))] if np.ndim(p) == 1 else [tuple(map(float, q)) for q in p]
 
 
-def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pace=None, gap=None, end=None, end_trailheads=False, min_end_dist_mi=1.0,
-               max_road_fraction=0.1, trailhead_roads_m=400.0, roads=False, roads_only=False, paved_only=False,
+def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pace=None, gap=None, end=None,
+               end_trailheads=False, min_end_dist_mi=1.0, max_road_fraction=0.1, trailhead_roads_m=400.0, roads=False, roads_only=False, paved_only=False,
                road_time_frac=None, ways=None, closures=(), any_end=False, minimize=False, min_loop_mi=1.0,
                min_loop_frac=0.25, max_sac=None, dem="3dep", smooth_m=50.0, seg_max_m=500.0, time_limit_s=120.0,
                workers=8, verbose=False):
@@ -94,45 +125,55 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
     ``start`` is (lat, lon), or a list of them to let the solver pick. ``distance_mi`` is the most the route may
     run; or give ``time_h`` with ``pace`` (minutes per mile, which just sets the distance) or ``gap`` (grade-adjusted
     minutes per mile: each stretch then costs its Strava GAP-equivalent flat distance; a stretch run once counts the
-    average of its two directions). ``topology`` is one of ``core.TOPOLOGIES``; ``traverse`` needs ``end`` (a point or list) or
-    ``end_trailheads``. Roads: by default up to ``max_road_fraction`` of the distance, besides road crossings and
+    average of its two directions). ``topology`` is one of ``core.TOPOLOGIES``; ``traverse`` needs ``end`` (a point
+    or list) or ``end_trailheads``. Roads: by default up to ``max_road_fraction`` of the distance, besides road crossings and
     the roads within ``trailhead_roads_m`` of the start; ``roads`` allows any amount; ``roads_only`` uses streets
-    alone. ``ways`` is a dict (or JSON path) of OSM way ids, {"include": [...], "exclude": [...]}. ``closures`` are
-    JSON files of closed segments, besides the bundled ones. ``max_sac`` (1-6) skips harder trails.
+    alone. ``ways`` is a dict (or JSON path) of OSM way ids, {"include": [...], "exclude": [...]}: included ways
+    are used whatever their tags (e.g. a sidewalk), excluded ones never. ``closures`` are JSON files (a path or a
+    list) of closed segments, besides the bundled ones. ``max_sac`` (1-6) skips harder trails.
 
-    Raises VertmaxxerError if no route fits, or a data source fails.
+    Raises OptionError (a ValueError) for invalid options, and VertmaxxerError if no route fits or a data source
+    fails.
     """
+    for name, x in dict(distance_mi=distance_mi, time_h=time_h, pace=pace, gap=gap).items():
+        if x is not None and not x > 0:
+            raise OptionError(f"{name} must be positive")
     budget_flat = None  # grade-adjusted (flat-equivalent) m, with a time at a GAP
     if time_h is not None:
         if distance_mi is not None:
-            raise ValueError("give a distance or a time, not both")
+            raise OptionError("give a distance or a time, not both")
         if (pace is None) == (gap is None):
-            raise ValueError("with a time, give one of pace or gap (minutes per mile)")
+            raise OptionError("with a time, give one of pace or gap (minutes per mile)")
         if pace is not None:
             distance_mi = time_h * 60 / pace
         elif minimize:
-            raise ValueError("minimize needs a distance, or a time with a pace")
+            raise OptionError("minimize needs a distance, or a time with a pace")
         else:
             budget_flat = time_h * 60 / gap * MI_TO_M
             g = np.linspace(0, 50, 501)
             distance_mi = budget_flat / MI_TO_M / np.min((core.gap_factor(g) + core.gap_factor(-g)) / 2)
     elif distance_mi is None:
-        raise ValueError("give distance_mi, or time_h with pace or gap")
+        raise OptionError("give distance_mi, or time_h with pace or gap")
     if topology not in core.TOPOLOGIES:
-        raise ValueError(f"unknown topology {topology!r}; one of {', '.join(core.TOPOLOGIES)}")
+        raise OptionError(f"unknown topology {topology!r}; one of {', '.join(core.TOPOLOGIES)}")
     shape = core.TOPOLOGIES[topology]
     starts_ll = _points(start)
     ends_ll = _points(end) if end is not None else []
     p2p = bool(ends_ll) or end_trailheads
     if ends_ll and end_trailheads:
-        raise ValueError("give either end or end_trailheads")
+        raise OptionError("give either end or end_trailheads")
     if p2p and topology not in ("traverse", "any"):
-        raise ValueError(f"{topology} routes return to the start; use traverse or any for point-to-point")
+        raise OptionError(f"{topology} routes return to the start; use traverse or any for point-to-point")
     if topology == "traverse" and not p2p:
-        raise ValueError("traverse needs end or end_trailheads")
+        raise OptionError("traverse needs end or end_trailheads")
     if roads_only and end_trailheads:
-        raise ValueError("end_trailheads finds trail ends; with roads_only give end")
-    if isinstance(ways, str):
+        raise OptionError("end_trailheads finds trail ends; with roads_only give end")
+    if isinstance(closures, (str, os.PathLike)):
+        closures = [closures]
+    for f in list(closures) + ([ways] if isinstance(ways, (str, os.PathLike)) else []):
+        if not os.path.isfile(f):
+            raise OptionError(f"no such file: {f}")
+    if isinstance(ways, (str, os.PathLike)):
         ways = json.load(open(ways))
     ways = ways or {}
     include, exclude = set(ways.get("include", ())), set(ways.get("exclude", ()))
@@ -144,21 +185,28 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
     closed = core.load_closures(sorted(core.CLOSURES_DIR.glob("*.json")) + list(closures))
     heads = {}
     if end_trailheads:  # the route may end anywhere within the full budget of the start
-        osm = core.fetch_osm(starts_ll, budget, True)
+        osm = core.fetch_osm(starts_ll, budget, True, include)
         heads = core.road_trailheads(osm, starts_ll, budget, roads, max_sac, closed)
         heads = {n: h for n, h in heads.items()
                  if min(core._haversine(h[0], h[1], la, lo) for la, lo in starts_ll) >= min_end_dist_mi * MI_TO_M
                  and (any_end or (h[2].split(" at ")[-1] not in core.EXCLUDED_END_ROADS
                                   and all(core._haversine(h[0], h[1], la, lo) > r for la, lo, r in core.EXCLUDED_ENDS)))}
         print(f"{len(heads)} trailheads at least {min_end_dist_mi:g} mi from the start")
+        if not heads:
+            raise VertmaxxerError(f"No trailhead within reach is at least {min_end_dist_mi:g} mi from the start; "
+                                  "lower --min-end-dist or raise the distance")
     else:
-        osm = core.fetch_osm(anchors, budget / 2, True)
+        osm = core.fetch_osm(anchors, budget / 2, True, include)
     if exclude:
         osm = dict(osm, elements=[el for el in osm["elements"] if not (el["type"] == "way" and el["id"] in exclude)])
     # A start nearer a street than a trail starts on the street; the walk from it to the trails is a road walk.
     street = (list(range(len(anchors))) if roads_only
               else [k for k, p in enumerate(starts_ll) if _nearer_street(osm, p)])
-    edges, anchor_ids = core.build_graph(osm, True, max_sac, anchors, extra_ids=heads, closed=closed, snap_roads=street)
+    missing = include - {el["id"] for el in osm["elements"] if el["type"] == "way"}
+    if missing:
+        print(f"Warning: {len(missing)} included ways aren't in OpenStreetMap: {', '.join(map(str, sorted(missing)))}")
+    edges, anchor_ids = core.build_graph(osm, True, max_sac, anchors, extra_ids=heads, closed=closed, snap_roads=street,
+                                         include=include)
     if any_roads:  # major roads only where they meet others
         edges = [e for e in edges if not e.get("major")]
     else:  # trails, and road walks between them; crossings and the start's own roads are free
@@ -177,17 +225,22 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
         edges = core.road_connectors(edges, road_time_frac * budget / core.ROAD_GAP_MIN)
     starts = anchor_ids[: len(starts_ll)]
     ends = list(heads) if end_trailheads else anchor_ids[len(starts_ll) :] or None
-    edges = core.contract(core.prune(edges, budget, starts, ends), set(anchor_ids) | set(heads))
+    # Routes that turn around mid-trail may run any edge partway; it's split at seg_max_m below.
+    edges = core.contract(core.prune(edges, budget, starts, ends, partial=shape["spurs"] != 0),
+                          set(anchor_ids) | set(heads))
     core.add_elevation(edges, smooth_m, dem)
     edges = core.prune(core.subdivide(edges, None if shape["spurs"] == 0 else seg_max_m), budget, starts, ends)
     if budget_flat is not None:
         for e in edges:
             e["cost"] = sum(e["gap"]) / 2
+    if shape["spurs"] != 0:
+        edges = _tidy(edges, set(starts) | set(ends or ()))
 
     m, s, t, proven = core.solve(edges, starts, ends, budget_flat or budget, shape, min_loop_mi * MI_TO_M, time_limit_s, workers,
                                  verbose, min_loop_frac=min_loop_frac, road_time_frac=road_time_frac,
                                  minimize=minimize, max_road_frac=None if any_roads else max_road_fraction,
-                                 min_length=0.98 * budget if minimize else 0.0)
+                                 min_length=0.98 * budget if minimize else 0.0,
+                                 turn_penalty=TURN_PENALTY_M if shape["spurs"] != 0 else 0.0)
     return _route(edges, m, s, t, proven, min_loop_mi * MI_TO_M, min_loop_frac, heads, anchors)
 
 
@@ -218,13 +271,13 @@ def read_gpx(path):
 
 
 def _along(pts):
-    lat0 = np.radians(pts[:, 0].mean())
-    return np.r_[0, np.cumsum(np.hypot(np.diff(pts[:, 1]) * 111320 * np.cos(lat0), np.diff(pts[:, 0]) * 110540))]
+    return np.r_[0, np.cumsum(core._haversine(pts[:-1, 0], pts[:-1, 1], pts[1:, 0], pts[1:, 1]))]
 
 
 def _match(edges, pts, tol, start, end):
     """Times the track runs each edge: the junctions it passes within ``tol`` (m), in order, from ``start`` to
-    ``end``, joined by the shortest trail between them, so the result is always one continuous walk."""
+    ``end``, each pair joined by whichever of the few shortest trails between them best matches the track's length
+    there (so the long way round a loop isn't swapped for the short one); the result is one continuous walk."""
     lat0 = np.radians(pts[:, 0].mean())
     G = nx.MultiGraph()
     xy = {}
@@ -237,17 +290,24 @@ def _match(edges, pts, tol, start, end):
     d = _along(pts)
     s = np.arange(0, d[-1], 5.0)
     trk = np.c_[np.interp(s, d, pts[:, 1]) * 111320 * np.cos(lat0), np.interp(s, d, pts[:, 0]) * 110540]
-    seq = [start]
-    for p in trk:
+    seq, at = [start], [0.0]
+    for p, si in zip(trk, s):
         dd = np.hypot(*(nxy - p).T)
         i = int(dd.argmin())
         if dd[i] <= tol and seq[-1] != nodes[i]:
             seq.append(nodes[i])
+            at.append(si)
     if seq[-1] != end:
         seq.append(end)
+        at.append(d[-1])
+    H = nx.Graph()  # shortest parallel edge only
+    for u, v, w in G.edges(data="w"):
+        if u != v and (not H.has_edge(u, v) or H[u][v]["w"] > w):
+            H.add_edge(u, v, w=w)
     counts = np.zeros(len(edges), int)
-    for a, b in zip(seq, seq[1:]):
-        path = nx.shortest_path(G, a, b, weight="w")
+    for a, b, ds in zip(seq, seq[1:], np.diff(at)):
+        paths = [q for _, q in zip(range(4), nx.shortest_simple_paths(H, a, b, weight="w"))]
+        path = min(paths, key=lambda q: abs(nx.path_weight(H, q, "w") - ds))
         for u, v in zip(path, path[1:]):
             counts[min(G[u][v], key=lambda k: G[u][v][k]["w"])] += 1
     if (counts > 2).any():
@@ -255,30 +315,34 @@ def _match(edges, pts, tol, start, end):
     return np.minimum(counts, 2)
 
 
-def spurify(track, extra_mi=None, budget_mi=None, *, time_limit_s=60.0, workers=8, match_m=15.0, summit_m=60.0):
+def spurify(track, extra_mi=None, budget_mi=None, *, time_limit_s=60.0, workers=8, match_m=15.0, summit_m=60.0,
+            dem="3dep"):
     """Add out-and-back side trips to named summits to a route, keeping the route itself.
 
     ``track`` is a GPX path or an (n, 2) array of lat, lon. Give ``extra_mi`` (miles that may be added) or
     ``budget_mi`` (total miles). Side trips turn around only at peaks within ``summit_m`` of a trail (or where the
-    route already turns around); ``match_m`` is how closely the track must follow the trails.
+    route already turns around); ``match_m`` is how closely the track must follow the trails. The extra miles
+    count from the length of trail the track matches.
     """
     if (extra_mi is None) == (budget_mi is None):
-        raise ValueError("give one of extra_mi or budget_mi")
-    pts = read_gpx(track) if isinstance(track, str) else np.asarray(track, float)
+        raise OptionError("give one of extra_mi or budget_mi")
+    pts = read_gpx(track) if isinstance(track, (str, os.PathLike)) else np.asarray(track, float)
+    if len(pts) < 2:
+        raise VertmaxxerError("The route has no track points")
     L0 = _along(pts)[-1]
-    budget = budget_mi * MI_TO_M if budget_mi is not None else L0 + extra_mi * MI_TO_M
-    reach = max(budget - L0, 0) / 2 + 300  # side trips go out and back
+    extra = budget_mi * MI_TO_M - L0 if budget_mi is not None else extra_mi * MI_TO_M
+    reach = max(extra, 0) / 2 + 300  # side trips go out and back
     closed_loop = core._haversine(*pts[0], *pts[-1]) < 100
     centers = pts[np.linspace(0, len(pts) - 1, max(2, int(L0 / max(reach, 500)) + 2)).astype(int)]
 
-    print(f"Route {L0 / MI_TO_M:.2f} mi; budget {budget / MI_TO_M:.2f} mi; fetching trails and peaks...")
+    print(f"Route {L0 / MI_TO_M:.2f} mi; up to {extra / MI_TO_M:.2f} mi more; fetching trails and peaks...")
     osm = core.fetch_osm([tuple(c) for c in centers], reach + 200, True)
     q = "[out:json][timeout:180];(" + "".join(
         f'node["natural"="peak"]["name"](around:{reach + 200:.0f},{la:.6f},{lo:.6f});' for la, lo in centers) + ");out;"
     peaks = {x["id"]: (x["lat"], x["lon"], x["tags"]["name"]) for x in core._overpass(q, "peaks")["elements"]}
     anchors = [tuple(pts[0]), tuple(pts[-1])] + [(la, lo) for la, lo, _ in peaks.values()]
     closures = core.load_closures(sorted(core.CLOSURES_DIR.glob("*.json")))
-    raw, ids = core.build_graph(osm, True, None, anchors, closed=closures)
+    raw, ids = core.build_graph(osm, True, None, anchors, closed=closures, report=2)
     raw = [e for e in raw if not e.get("major")]  # highways only where they meet other ways
     at = {}
     for e in raw:
@@ -287,14 +351,17 @@ def spurify(track, extra_mi=None, budget_mi=None, *, time_limit_s=60.0, workers=
               if n in at and core._haversine(*at[n], la, lo) <= summit_m}
     start, end = ids[0], (ids[0] if closed_loop else ids[1])
     edges = core.contract([dict(e) for e in raw], {start, end} | set(summit))
-    core.add_elevation(edges, 50.0, "3dep")
-    edges = core.subdivide(edges, None)  # per-edge climb, no splitting
+    core.add_elevation(edges, 50.0, dem)
+    edges = _collapse_parallel(core.subdivide(edges, None))  # per-edge climb, no splitting
 
     base = _match(edges, pts, match_m, start, end)
     L_base = sum(e["length"] * c for e, c in zip(edges, base))
     if abs(L_base - L0) > 0.05 * L0:
         print(f"Warning: the route matched {L_base / MI_TO_M:.2f} mi of trail for a {L0 / MI_TO_M:.2f} mi track; "
               "try a larger match distance.")
+    budget = budget_mi * MI_TO_M if budget_mi is not None else L_base + extra_mi * MI_TO_M
+    if budget < L_base:
+        raise VertmaxxerError(f"The budget is shorter than the route itself ({L_base / MI_TO_M:.2f} mi of trail)")
     # The route's own turnarounds stay allowed; anything new turns around only at a summit.
     G = nx.MultiGraph()
     for e, c in zip(edges, base):
@@ -320,7 +387,7 @@ def spurify(track, extra_mi=None, budget_mi=None, *, time_limit_s=60.0, workers=
     d_base = _along(pts)
     lat0 = np.radians(pts[:, 0].mean())
     trips = []
-    for comp in sorted(nx.connected_components(H), key=lambda c: -len(c)):
+    for comp in nx.connected_components(H):
         ks = [H[u][v]["k"] for u, v in H.subgraph(comp).edges]
         junction = next((n for n in comp if n in G), None)
         mi = float("nan")
@@ -331,5 +398,6 @@ def spurify(track, extra_mi=None, budget_mi=None, *, time_limit_s=60.0, workers=
         trips.append(SideTrip(leaves_at_mi=float(mi), length_mi=2 * sum(edges[k]["length"] for k in ks) / MI_TO_M,
                               gain_ft=sum(edges[k]["var"] for k in ks) * M_TO_FT,  # out and back: all |dz| climbed once
                               summits=[summit[n] for n in comp if n in summit]))
+    trips.sort(key=lambda t: t.leaves_at_mi)
     return Spurred(route=route, base_gain_ft=float(np.sum(np.maximum(0, np.diff(base_route["z"]))) * M_TO_FT),
                    base_distance_mi=L_base / MI_TO_M, side_trips=trips)

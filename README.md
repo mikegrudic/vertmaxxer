@@ -4,7 +4,7 @@ Give it a starting point, a distance and a route shape. It finds the route with 
 OpenStreetMap trail network, and writes a GPX file.
 
 ```
-vertmaxxer --start 41.42698,-73.96568 --distance 15 --topology lollipop
+vertmaxxer --start 42.03545,-74.35961 --distance 16 --topology loop
 ```
 
 Elevation comes from USGS 3DEP, so it works in the US only. The solver uses OR-Tools CP-SAT; the model is
@@ -24,6 +24,7 @@ run near the same start is much faster.
 ## Vertmaxx a route
 
 1. **Get the start as `lat,lon`.** In Google Maps, right-click the spot and click the coordinates to copy them.
+   Maps copies them with a space after the comma: delete it, or quote the pair (`--start "42.03545, -74.35961"`).
    The route starts on the nearest trail or street to that point. From a house, it walks the streets to the
    trails: the first 400 m are free, and the rest counts toward `--max-road-fraction`. To start on a particular
    trail, put the point on it.
@@ -69,6 +70,9 @@ By default it plays by the same rules as the published survey:
   trails still in OSM.
 - **Traverses** with `--end-trailheads` don't end on the Mount Washington Auto Road, at the Mount Washington summit,
   or on Breakneck Road (NY 9D).
+- **Turnarounds** (in out-and-backs and `any` routes) each count as 30 ft of climbing given up, so a route
+  doesn't nip a few meters up a side street for a few feet. Dead-end road stubs under 100 m (alleys, lot
+  entrances) and duplicate short ways are ignored.
 - **Loops** are at least 1 mi and a quarter of the route long, and a traverse ends at least 1 mi from its start.
 
 ### Useful options
@@ -126,8 +130,8 @@ or technical trail, expect to be slower than it says.
 roads) counts as a trail and is left out, while a gravel town road counts as a road and is kept unless you add
 `--paved-only`.
 
-A `--ways` file fine-tunes the network: `include` adds ways of any type (a cemetery lane, a pedestrian tunnel), and
-`exclude` drops ways (a private drive). Way ids come from openstreetmap.org: click a way and read the id from the URL.
+A `--ways` file fine-tunes the network: `include` adds ways of any type, even ones normally left out such as
+sidewalks (a cemetery lane, a pedestrian tunnel), and `exclude` drops ways (a private drive). Way ids come from openstreetmap.org: click a way and read the id from the URL.
 Dead ends of included paths are joined to the nearest street within 30 m, since the graph leaves out sidewalks.
 `examples/cold_spring_road_runs.json` is the Cold Spring setup: the cemetery lanes and the Main Street tunnel, without
 the private drives.
@@ -143,16 +147,23 @@ vertmaxxer --start 41.41602,-73.96122 --roads-only --ways examples/cold_spring_r
 ## Add summit side trips to a route
 
 To add out-and-back side trips to summits to a route you already have (from this tool, CalTopo or a watch),
-use `spurify.py`. It keeps your route and adds trips that turn around only at named peaks:
+use `vertmaxxer-spurify`. It keeps your route and adds out-and-back trips that turn around only at named peaks
+(or where your route already turns around):
 
 ```
 vertmaxxer-spurify my_route.gpx --extra 3        # up to 3 more miles
 vertmaxxer-spurify my_route.gpx --budget 30      # or a total distance
 ```
 
-It writes `my_route_spurred.gpx` (or `-o FILE`) and prints a table of the side trips added, with their length, gain and
-summits. If it warns that the matched length is off, which can happen with a noisy watch track, raise
-`--match-m`.
+It writes `my_route_spurred.gpx` (or `-o FILE`) and prints a table of the side trips added, in route order, with
+their length, gain and summits. `--extra` counts from the length of trail your track follows, which is often a
+little longer than the track itself. If it warns that the matched length is off, which can happen with a noisy
+watch track, raise `--match-m`.
+
+A trip listed as "(connector, no summit)" is trail run out and back without a summit of its own: usually the
+shared approach to several side trips, or a short climb worth its miles. Spurify's "Before" gain can differ by a
+percent or so from `vertmaxxer`'s figure for the same route, because elevation smoothing is pinned at trail
+junctions and the two build their networks with different junctions.
 
 ## Python API
 
@@ -181,5 +192,6 @@ print(s.base_gain_ft, s.route.gain_ft, s.side_trips)
 |---------|------------|
 | `All Overpass servers failed` | The OpenStreetMap servers are busy. Try again in a few minutes |
 | HTTP 504 from the USGS elevation service | Add `--dem terrarium` to use AWS terrain tiles instead |
+| `No route found within the 120 s time limit` | The search ran out of time before finding any route; give it a longer `--time-limit`. Big networks and the two-loop shapes need minutes |
 | `No feasible route found` | No route of that shape fits the distance. A loop may need a longer road walk between trailheads: raise `--max-road-fraction`. Otherwise try more miles or another shape |
 | A start snapped hundreds of meters away | The point isn't near a mapped trail. Move it onto the trail |

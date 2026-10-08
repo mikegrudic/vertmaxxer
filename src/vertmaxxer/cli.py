@@ -2,15 +2,34 @@
 import argparse
 import os
 import re
+import sys
 
 from . import core
-from .api import VertmaxxerError, find_route, spurify
+from .api import OptionError, VertmaxxerError, find_route, spurify
 from .core import MI_TO_M
 
 
 def _latlon(text):
-    lat, lon = (float(x) for x in text.split(","))
+    try:
+        lat, lon = (float(x) for x in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} isn't LAT,LON; write 41.42698,-73.96568, or quote it if it has a "
+                                         'space: "41.42698, -73.96568"')
     return lat, lon
+
+
+def _time_h(text):
+    """H:MM or H:MM:SS, or a number of hours up to 24."""
+    h = _clock(text)
+    if ":" not in text and h > 24:
+        raise argparse.ArgumentTypeError(f"{text} hours? Give the time as H:MM, e.g. 1:30")
+    return h
+
+
+def _line_buffered():
+    """Show progress as it happens even when output goes to a pipe or a file."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
 
 
 def _clock(text):
@@ -41,7 +60,7 @@ def main(argv=None):
                    help="lat,lon of a trailhead; repeat to let the solver choose among several")
     budget = p.add_mutually_exclusive_group(required=True)
     budget.add_argument("--distance", type=float, help="max route distance (miles)")
-    budget.add_argument("--time", type=_clock, metavar="H:MM", help="max route time, with --pace or --gap")
+    budget.add_argument("--time", type=_time_h, metavar="H:MM", help="max route time, with --pace or --gap")
     pace = p.add_mutually_exclusive_group()
     pace.add_argument("--pace", type=_clock, metavar="M:SS", help="with --time: pace per mile (sets the distance)")
     pace.add_argument("--gap", type=_clock, metavar="M:SS",
@@ -81,11 +100,12 @@ def main(argv=None):
     p.add_argument("--smooth", type=float, default=50.0, help="elevation smoothing e-folding length (m)")
     p.add_argument("--seg-max", type=float, default=500.0, help="turnaround resolution when spurs are allowed (m)")
     p.add_argument("--time-limit", type=float, default=120.0, help="solver time limit (s)")
-    p.add_argument("--workers", type=int, default=min(8, os.cpu_count()), help="solver threads")
+    p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1), help="solver threads")
     p.add_argument("--verbose", action="store_true", help="show the CP-SAT search log")
     p.add_argument("-o", "--output", default="vertmaxxer.gpx", help="GPX to write (default vertmaxxer.gpx)")
     p.add_argument("--plot", help="also write a map + profile figure here (needs matplotlib)")
     a = p.parse_args(argv)
+    _line_buffered()
 
     try:
         r = find_route(a.start, a.distance, a.topology, time_h=a.time, pace=a.pace, gap=a.gap, end=a.end,
@@ -95,7 +115,7 @@ def main(argv=None):
                        minimize=a.minimize, min_loop_mi=a.min_loop, min_loop_frac=a.min_loop_frac, max_sac=a.max_sac,
                        dem=a.dem, smooth_m=a.smooth, seg_max_m=a.seg_max, time_limit_s=a.time_limit,
                        workers=a.workers, verbose=a.verbose)
-    except ValueError as err:
+    except OptionError as err:
         p.error(str(err))
     except VertmaxxerError as err:
         raise SystemExit(str(err))
@@ -126,14 +146,18 @@ def spurify_main(argv=None):
     g.add_argument("--budget", type=float, help="total miles")
     p.add_argument("-o", "--output", help="GPX to write (default ROUTE_spurred.gpx)")
     p.add_argument("--time-limit", type=float, default=60, help="solver time limit (s, default 60)")
-    p.add_argument("--workers", type=int, default=min(8, os.cpu_count()))
+    p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
     p.add_argument("--match-m", type=float, default=15, help="how close the track must follow a trail (m)")
     p.add_argument("--summit-m", type=float, default=60, help="how close a trail must pass a peak (m)")
+    p.add_argument("--dem", choices=["3dep", "terrarium"], default="3dep", help="elevation source")
     a = p.parse_args(argv)
+    _line_buffered()
 
     try:
         s = spurify(a.gpx, a.extra, a.budget, time_limit_s=a.time_limit, workers=a.workers, match_m=a.match_m,
-                    summit_m=a.summit_m)
+                    summit_m=a.summit_m, dem=a.dem)
+    except OptionError as err:
+        p.error(str(err))
     except VertmaxxerError as err:
         raise SystemExit(str(err))
     out = a.output or re.sub(r"\.gpx$", "", a.gpx) + "_spurred.gpx"

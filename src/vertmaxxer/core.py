@@ -62,7 +62,12 @@ class VertmaxxerError(Exception):
     """No route, or a data source failed."""
 
 
+class OptionError(ValueError):
+    """Inconsistent or invalid options."""
+
+
 CACHE_DIR = Path(os.environ.get("VERTMAXXER_CACHE", Path.home() / ".cache" / "vertmaxxer"))
+OVERPASS_WAITS = [5, 10, 20, 30, 45, 60, 60, 60]  # s after each failed attempt: about five minutes in all
 OVERPASS_URLS = ["https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter"]
 DEM_URL = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
 DEM_RES_DEG = 1.0 / 3 / 3600  # 1/3 arc-second, ~10 m
@@ -125,22 +130,36 @@ def _haversine(lat1, lon1, lat2, lon2):
 
 
 def _cached(name, fetch, load, save):
+    """``load`` the cached file, or ``fetch`` and ``save`` it. Files are written whole or not at all, and an
+    unreadable one (e.g. from an older, interrupted run) is fetched again."""
     path = CACHE_DIR / name
     if path.exists():
-        return load(path)
+        try:
+            return load(path)
+        except Exception:
+            print(f"Cached {name} is unreadable; fetching it again")
+            path.unlink()
     data = fetch()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    save(path, data)
+    tmp = path.with_name(f".{path.stem}.{os.getpid()}.tmp{path.suffix}")  # same suffix: np.save keeps the name
+    try:
+        save(tmp, data)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return data
 
 
 # ---------------------------------------------------------------- OSM graph
 
-def fetch_osm(points, radius_m, roads):
+def fetch_osm(points, radius_m, roads, way_ids=()):
+    """Trails (and roads) within ``radius_m`` of the points, plus the ways in ``way_ids`` whatever their type."""
     highways = "|".join(dict.fromkeys(TRAIL_HIGHWAYS + (ROAD_HIGHWAYS + MAJOR_ROADS if roads else [])))
     clauses = "".join(
         f'way["highway"~"^({highways})$"](around:{radius_m:.0f},{lat:.6f},{lon:.6f});' for lat, lon in points
     )
+    if way_ids:
+        clauses += f"way(id:{','.join(map(str, sorted(way_ids)))});"
     return _overpass(f"[out:json][timeout:300];({clauses});(._;>;);out body;", "osm")
 
 
@@ -148,14 +167,20 @@ def _overpass(query, prefix):
     """Run an Overpass query, trying each mirror, with the result cached on disk."""
     def fetch():
         print("Querying Overpass...")
-        for attempt, url in enumerate(OVERPASS_URLS * 2):
+        for attempt, wait in enumerate(OVERPASS_WAITS):
+            url = OVERPASS_URLS[attempt % len(OVERPASS_URLS)]
             try:
                 r = requests.post(url, data={"data": query}, headers=HEADERS, timeout=360)
                 r.raise_for_status()
-                return r.json()
-            except requests.RequestException as err:
-                print(f"  {url}: {err}")
-                time.sleep(5 * (attempt + 1))
+                data = r.json()
+                # Server-side timeouts and out-of-memory errors come back as 200 with partial data and a remark.
+                remark = data.get("remark", "")
+                if "runtime error" in remark or "timed out" in remark:
+                    raise requests.RequestException(remark)
+                return data
+            except (requests.RequestException, ValueError) as err:
+                print(f"  {url}: {err}; retrying in {wait} s")
+                time.sleep(wait)
         raise VertmaxxerError("All Overpass servers failed; try again later.")
 
     key = hashlib.sha1(query.encode()).hexdigest()[:16]
@@ -223,20 +248,23 @@ def _usable(tags, roads, max_sac):
     return True
 
 
-def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, closed=frozenset(), snap_roads=()):
+def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, closed=frozenset(), snap_roads=(),
+                include=frozenset(), report=None):
     """Split usable ways at junctions (and at ``extra_ids``) and snap anchor points to the nearest way node.
 
     With ``connectors_m`` > 0 (and ``osm`` fetched with roads), road stretches of at most that length
     joining two trails are kept as connectors, e.g. to cross a road between adjacent trailheads.
     ``closed`` holds OSM node pairs (frozensets) of closed segments, which are dropped. Anchors whose
     index is in ``snap_roads`` snap to the nearest road node instead (for starts on a street, e.g. a house).
+    Ways in ``include`` are used whatever their tags. Only the first ``report`` anchors' snaps are printed.
 
     Returns (edges, anchor_ids), where each edge is a dict with OSM node ids
     ``u``, ``v``, polyline ``latlon`` (k, 2), per-vertex trail ``names``,
     ``length`` (m) and ``road``.
     """
     nodes = {el["id"]: (el["lat"], el["lon"]) for el in osm["elements"] if el["type"] == "node"}
-    ways = [el for el in osm["elements"] if el["type"] == "way" and _usable(el.get("tags", {}), roads, max_sac)]
+    ways = [el for el in osm["elements"] if el["type"] == "way" and "highway" in el.get("tags", {})
+            and (el["id"] in include or _usable(el["tags"], roads, max_sac))]
     if not ways:
         raise VertmaxxerError("No usable ways found near the trailhead(s).")
     if closed:
@@ -248,6 +276,8 @@ def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, cl
         snap_ways = [w for w in ways if _is_road(w["tags"]["highway"]) == on_road
                      and not (on_road and _not_a_start(w["tags"]))]
         way_nodes = np.array(sorted({n for w in snap_ways for n in w["nodes"]}))
+        if not len(way_nodes):
+            raise VertmaxxerError(f"No {'streets' if on_road else 'trails'} near {lat:.5f}, {lon:.5f}")
         way_ll = np.array([nodes[n] for n in way_nodes])
         # Snap to the nearest node of the biggest trail network within SNAP_M, so a stub path at a
         # parking lot or campground doesn't capture the start.
@@ -266,8 +296,9 @@ def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, cl
         else:
             i = int(np.argmin(d))
         tags = next(iter(f" ({w['tags'].get('name', w['tags']['highway'])})" for w in snap_ways if way_nodes[i] in w["nodes"]))
-        print(f"({lat}, {lon}) snapped {d[i]:.0f} m to OSM node {way_nodes[i]}{tags}, "
-              f"in a trail network of {comp_size[way_nodes[i]]} nodes")
+        if report is None or k < report:
+            print(f"({lat}, {lon}) snapped {d[i]:.0f} m to OSM node {way_nodes[i]}{tags}, "
+                  f"in a network of {comp_size[way_nodes[i]]} nodes")
         anchor_ids.append(int(way_nodes[i]))
 
     count = Counter(n for w in ways for n in w["nodes"])
@@ -462,18 +493,25 @@ def _mapping_gaps(ways, nodes, count):
     return sorted(pairs)
 
 
-def prune(edges, budget, starts, ends):
-    """Keep edges that some route within budget could traverse."""
+def prune(edges, budget, starts, ends, partial=False):
+    """Keep edges that some route within budget could traverse (with ``partial``, run part of: for routes that
+    may turn around mid-edge once long edges are split)."""
     G = nx.Graph()
     for e in edges:
         if not G.has_edge(e["u"], e["v"]) or G[e["u"]][e["v"]]["w"] > e["length"]:
             G.add_edge(e["u"], e["v"], w=e["length"])
+    if not set(starts) & set(G):
+        raise VertmaxxerError("The start isn't on any usable trail or road")
+    if ends is not None and not set(ends) & set(G):
+        raise VertmaxxerError("No end is on a usable trail or road")
     d_s = nx.multi_source_dijkstra_path_length(G, set(starts) & set(G), cutoff=budget, weight="w")
     d_t = d_s if ends is None else nx.multi_source_dijkstra_path_length(G, set(ends) & set(G), cutoff=budget, weight="w")
     inf = math.inf
 
     def ok(e):
         u, v = e["u"], e["v"]
+        if partial:
+            return min(d_s.get(u, inf) + d_t.get(u, inf), d_s.get(v, inf) + d_t.get(v, inf)) <= budget
         return min(d_s.get(u, inf) + d_t.get(v, inf), d_s.get(v, inf) + d_t.get(u, inf)) + e["length"] <= budget
 
     kept = [e for e in edges if ok(e)]
@@ -744,13 +782,14 @@ def subdivide(edges, seg_max):
 
 def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, verbose, hint=None,
           min_loop_frac=0.0, road_time_frac=None, start_cost=None, minimize=False, min_length=0.0,
-          no_turnarounds=False, turnaround_ok=(), max_road_frac=None):
+          no_turnarounds=False, turnaround_ok=(), max_road_frac=None, turn_penalty=0.0):
     """Return (traversal count per edge, start node, end node, proven optimal) for the best route found.
 
     ``topology`` is a TOPOLOGIES entry. Each loop must be at least ``min_loop`` (m) long and at least
     ``min_loop_frac`` of the route's total distance. With ``road_time_frac``, road segments may take at most
     that share of the route's grade-adjusted time (a segment run once counts both directions' average); with
-    ``max_road_frac``, at most that share of its distance.
+    ``max_road_frac``, at most that share of its distance. Each turnaround costs ``turn_penalty`` (m of gain), so
+    one has to climb at least that much to be worth it.
 
     An edge's optional ``cost`` (m) replaces its length in the budget, e.g. grade-adjusted time as flat distance.
 
@@ -776,6 +815,9 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
     p2p = ends is not None
     loops, spurs, start_on = topology["loops"], topology["spurs"], topology["start"]
     reuse, retrace_loops = topology["reuse"], topology.get("retrace_loops", False)
+    starts = [n for n in starts if n in idx]
+    if not starts:
+        raise VertmaxxerError("No start is reachable within the distance budget.")
     S = [idx[n] for n in starts]
     if p2p:
         ends = [n for n in ends if n in idx]
@@ -930,7 +972,7 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
     for n in range(N):
         deg_a = sum(m * a[e] for e, m in inc[n]) + (sum(virt[n]) if p2p else 0)
         md.Add(deg_a == 2 * md.NewIntVar(0, len(inc[n]) + 1, f"k{n}"))
-        if spurs is not None:
+        if spurs is not None or turn_penalty:
             leaf = md.NewBoolVar(f"leaf{n}")
             md.Add(sum(m * (a[e] + b[e]) for e, m in inc[n]) + sum(virt[n]) + leaf >= 2 * v[n])
             leaves.append(leaf)
@@ -956,6 +998,8 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
     objective = sum(dz[e] * (a[e] + 2 * b[e]) for e in range(E))
     if p2p:
         objective += sum(z_node[n] * t[j] for j, n in enumerate(T)) - sum(z_node[n] * s[i] for i, n in enumerate(S))
+    if turn_penalty:
+        objective += (1 if minimize else -1) * round(20 * turn_penalty) * sum(leaves)
     if min_length:
         md.Add(sum(L[e] * (a[e] + 2 * b[e]) for e in range(E)) + extra >= int(min_length))
     if minimize:
@@ -1003,7 +1047,7 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
     print(f"Solving: {N} nodes, {E} edges, {time_limit:.0f} s limit, {workers} workers")
     status = solver.Solve(md, Progress())
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise VertmaxxerError(f"No feasible route found ({solver.StatusName(status)})")
+        raise VertmaxxerError(_no_route(solver.StatusName(status), time_limit))
     print(f"  {solver.StatusName(status).lower()}: gain {solver.ObjectiveValue() / 20 * M_TO_FT:,.0f} ft, "
           f"bound {solver.BestObjectiveBound() / 20 * M_TO_FT:,.0f} ft")
 
@@ -1014,6 +1058,13 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
 
 
 # ---------------------------------------------------------------- output
+
+def _no_route(status, time_limit):
+    if status == "UNKNOWN":
+        return (f"No route found within the {time_limit:.0f} s time limit; try a longer --time-limit "
+                "(or more --workers)")
+    return f"No feasible route found ({status})"
+
 
 def assemble(edges, m, start, end):
     G = nx.MultiGraph()

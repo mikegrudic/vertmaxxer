@@ -1,7 +1,6 @@
 """Command-line tools: ``vertmaxxer`` finds a route, ``vertmaxxer-spurify`` adds summit side trips to one."""
 import argparse
 import os
-import re
 import sys
 
 from . import core
@@ -49,15 +48,41 @@ def _print_route(r):
         print(f"Ends at {r.end[2]} ({r.end[0]:.5f}, {r.end[1]:.5f})")
     print(f"Distance {r.distance_mi:.2f} mi, gain {r.gain_ft:,.0f} ft (unsmoothed {r.gain_raw_ft:,.0f} ft), "
           f"{r.gain_ft / r.distance_mi:,.0f} ft/mi{'; optimal' if r.proven else ''}")
-    for name, length in r.legs:
+    for name, length in _legs(r.legs):
         print(f"  {length / MI_TO_M:5.2f} mi  {name}")
+
+
+def _legs(legs, min_m=32.0):
+    """The turn list with legs under ``min_m`` (connectors, lot aisles) folded into the leg before them."""
+    out = []
+    for name, length in legs:
+        if out and (length < min_m or out[-1][0] == name):
+            out[-1][1] += length
+        else:
+            out.append([name, length])
+    return out
+
+
+def _writable(p, path, what):
+    """Fail now, not after the solve, if ``path`` can't be written."""
+    folder = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(folder) or not os.access(folder, os.W_OK):
+        p.error(f"can't write the {what} to {path}: {folder} isn't a writable folder")
+
+
+def _write(f, path):
+    try:
+        f(path)
+    except OSError as err:
+        raise SystemExit(f"Couldn't write {path}: {err}")
+    print(f"Wrote {path}")
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="vertmaxxer", description=core.__doc__, allow_abbrev=False,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--start", type=_latlon, action="append", required=True,
-                   help="lat,lon of a trailhead; repeat to let the solver choose among several")
+    p.add_argument("--start", type=_latlon, action="append", required=True, metavar="LAT,LON",
+                   help="where to start; repeat to let the solver choose among several")
     budget = p.add_mutually_exclusive_group(required=True)
     budget.add_argument("--distance", type=float, help="max route distance (miles)")
     budget.add_argument("--time", type=_time_h, metavar="H:MM", help="max route time, with --pace or --gap")
@@ -65,8 +90,8 @@ def main(argv=None):
     pace.add_argument("--pace", type=_clock, metavar="M:SS", help="with --time: pace per mile (sets the distance)")
     pace.add_argument("--gap", type=_clock, metavar="M:SS",
                       help="with --time: grade-adjusted pace per mile (Strava GAP); climbs and steep descents cost more")
-    p.add_argument("--topology", choices=core.TOPOLOGIES, default="lollipop")
-    p.add_argument("--end", type=_latlon, action="append",
+    p.add_argument("--topology", choices=core.TOPOLOGIES, default="lollipop", help="route shape (default lollipop)")
+    p.add_argument("--end", type=_latlon, action="append", metavar="LAT,LON",
                    help="lat,lon of a finish for point-to-point routes; repeatable")
     p.add_argument("--end-trailheads", action="store_true",
                    help="end at whichever trailhead (where a trail meets a paved road open to cars) gives the most gain")
@@ -75,7 +100,9 @@ def main(argv=None):
     p.add_argument("--any-end", action="store_true",
                    help="with --end-trailheads, also allow ends on the Mount Washington Auto Road, at its summit or "
                         "on Breakneck Road")
-    p.add_argument("--max-road-fraction", type=float, default=0.1, metavar="F",
+    p.add_argument("--marked-only", action="store_true",
+                   help="skip herd paths and other informal or unmarked ways (shown as \"(unmarked)\" otherwise)")
+    p.add_argument("--max-road-fraction", type=float, metavar="F",
                    help="at most this share of the route's distance on roads, e.g. a road walk between trailheads "
                         "(default 0.1; 0 for trails only). Road crossings and the start's own roads don't count")
     p.add_argument("--trailhead-roads", type=float, default=400.0, metavar="M",
@@ -106,10 +133,25 @@ def main(argv=None):
     p.add_argument("--plot", help="also write a map + profile figure here (needs matplotlib)")
     a = p.parse_args(argv)
     _line_buffered()
+    if a.max_road_fraction is not None and (a.roads or a.roads_only):
+        p.error("--max-road-fraction limits roads on trail routes; --roads and --roads-only allow any amount")
+    _writable(p, a.output, "route")
+    if a.plot:
+        _writable(p, a.plot, "plot")
+        try:
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+            from matplotlib.figure import Figure
+        except ImportError:
+            p.error('--plot needs matplotlib: pip install "vertmaxxer[plot]"')
+        kinds = FigureCanvasAgg(Figure()).get_supported_filetypes()
+        if os.path.splitext(a.plot)[1].lstrip(".").lower() not in kinds:
+            p.error(f"--plot needs a file name ending in one of: {', '.join('.' + k for k in sorted(kinds))}")
 
     try:
         r = find_route(a.start, a.distance, a.topology, time_h=a.time, pace=a.pace, gap=a.gap, end=a.end,
-                       end_trailheads=a.end_trailheads, min_end_dist_mi=a.min_end_dist, any_end=a.any_end, max_road_fraction=a.max_road_fraction,
+                       end_trailheads=a.end_trailheads, min_end_dist_mi=a.min_end_dist, any_end=a.any_end,
+                       max_road_fraction=0.1 if a.max_road_fraction is None else a.max_road_fraction,
+                       marked_only=a.marked_only,
                        trailhead_roads_m=a.trailhead_roads, roads=a.roads, roads_only=a.roads_only,
                        paved_only=a.paved_only, road_time_frac=a.road_time_frac, ways=a.ways, closures=a.closures,
                        minimize=a.minimize, min_loop_mi=a.min_loop, min_loop_frac=a.min_loop_frac, max_sac=a.max_sac,
@@ -127,12 +169,10 @@ def main(argv=None):
     elif a.pace:
         print(f"{_fmt(r.distance_mi * a.pace / 60)} at {_fmt(a.pace)}/mi")
     if a.topology != "any" and r.shape != a.topology:
-        print(f"Warning: requested {a.topology} but the route is a {r.shape}")
-    r.write_gpx(a.output)
-    print(f"Wrote {a.output}")
+        print(f"Warning: asked for a {a.topology}, but the best route found has another shape ({r.shape})")
+    _write(r.write_gpx, a.output)
     if a.plot:
-        r.plot(a.plot)
-        print(f"Wrote {a.plot}")
+        _write(r.plot, a.plot)
 
 
 def spurify_main(argv=None):
@@ -152,6 +192,8 @@ def spurify_main(argv=None):
     p.add_argument("--dem", choices=["3dep", "terrarium"], default="3dep", help="elevation source")
     a = p.parse_args(argv)
     _line_buffered()
+    out = a.output or os.path.splitext(a.gpx)[0] + "_spurred.gpx"
+    _writable(p, out, "route")
 
     try:
         s = spurify(a.gpx, a.extra, a.budget, time_limit_s=a.time_limit, workers=a.workers, match_m=a.match_m,
@@ -160,8 +202,7 @@ def spurify_main(argv=None):
         p.error(str(err))
     except VertmaxxerError as err:
         raise SystemExit(str(err))
-    out = a.output or re.sub(r"\.gpx$", "", a.gpx) + "_spurred.gpx"
-    s.route.write_gpx(out, os.path.basename(out)[:-4])
+    _write(lambda path: s.route.write_gpx(path, os.path.splitext(os.path.basename(path))[0]), out)
 
     print(f"\n{'Leaves route':>12s}  {'Out and back':>12s}  {'Gain':>8s}  {'ft/mi':>6s}  Summits")
     for t in s.side_trips:
@@ -171,4 +212,4 @@ def spurify_main(argv=None):
         print("  (none: no summit side trip fits the budget)")
     print(f"\nBefore: {s.base_gain_ft:,.0f} ft over {s.base_distance_mi:.2f} mi.  After: {s.route.gain_ft:,.0f} ft over "
           f"{s.route.distance_mi:.2f} mi ({s.route.gain_ft - s.base_gain_ft:+,.0f} ft)"
-          f"{'; optimal' if s.route.proven else ''}.  Wrote {out}")
+          f"{'; optimal' if s.route.proven else ''}.")

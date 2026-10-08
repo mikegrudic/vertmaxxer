@@ -1,7 +1,11 @@
 """Python API: find a route, or add summit side trips to one. The command-line tools are thin wrappers over these."""
+import contextlib
+import functools
+import io
 import json
+import math
 import os
-import re
+import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -144,7 +148,7 @@ def _loops_through(edges, node, lo, hi, avoid=(), tries=30, road_weight=1.0):
     return [ks for _, ks in sorted(found, key=lambda f: -f[0])]
 
 
-def _seed(edges, start, budget, shape, min_loop, min_loop_frac, max_road_frac=None, stems=8):
+def _seed(edges, start, budget, shape, min_loop, min_loop_frac, max_road_frac=None, stems=16):
     """A quick route to start the solver from, as a count per edge: for a loop, a loop through the start; for a
     lollipop, the climbiest of a few loops at the ends of short stems; within ``max_road_frac`` of road, if given.
     None for other shapes, or if none fits. Dense networks can otherwise take the solver minutes just to find a
@@ -183,16 +187,43 @@ def _seed(edges, start, budget, shape, min_loop, min_loop_frac, max_road_frac=No
     return best(cands)
 
 
-def _points(p):
-    """One (lat, lon) or a list of them, as a list."""
-    return [tuple(map(float, p))] if np.ndim(p) == 1 else [tuple(map(float, q)) for q in p]
+US = (17.0, 72.0, -180.0, -64.0)  # lat, lat, lon, lon: roughly where 3DEP has data (with Alaska, Hawaii, Puerto Rico)
 
 
+def _points(p, dem="3dep"):
+    """One (lat, lon), or "lat,lon", or a list of them, as a list of checked (lat, lon)."""
+    if isinstance(p, str):
+        p = p.split(",")
+    try:
+        pts = [tuple(map(float, p))] if np.ndim(p) == 1 else [tuple(map(float, q)) for q in p]
+    except (TypeError, ValueError):
+        raise OptionError(f"{p!r} isn't a (lat, lon) point or a list of them")
+    for la, lo in pts:
+        if not (math.isfinite(la) and math.isfinite(lo) and -90 <= la <= 90 and -180 <= lo <= 180):
+            raise OptionError(f"{la}, {lo} isn't a latitude, longitude")
+        if dem == "3dep" and not (US[0] <= la <= US[1] and US[2] <= lo <= US[3]):
+            raise OptionError(f"{la}, {lo} is outside the US, where 3DEP elevation is available: check the order "
+                              "(latitude first), or use the terrarium elevation source (--dem terrarium)")
+    return pts
+
+
+def _quietly(f):
+    """Run ``f`` with its progress output discarded when called with ``quiet=True``."""
+    @functools.wraps(f)
+    def g(*a, quiet=False, **k):
+        if not quiet:
+            return f(*a, **k)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return f(*a, **k)
+    return g
+
+
+@_quietly
 def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pace=None, gap=None, end=None,
                end_trailheads=False, min_end_dist_mi=1.0, max_road_fraction=0.1, trailhead_roads_m=400.0, roads=False, roads_only=False, paved_only=False,
                road_time_frac=None, ways=None, closures=(), any_end=False, minimize=False, min_loop_mi=1.0,
                min_loop_frac=0.25, max_sac=None, dem="3dep", smooth_m=50.0, seg_max_m=500.0, time_limit_s=120.0,
-               workers=8, verbose=False):
+               workers=8, verbose=False, marked_only=False):
     """The route with the most climbing (or with ``minimize``, the least) from ``start``.
 
     ``start`` is (lat, lon), or a list of them to let the solver pick. ``distance_mi`` is the most the route may
@@ -203,14 +234,20 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
     the roads within ``trailhead_roads_m`` of the start; ``roads`` allows any amount; ``roads_only`` uses streets
     alone. ``ways`` is a dict (or JSON path) of OSM way ids, {"include": [...], "exclude": [...]}: included ways
     are used whatever their tags (e.g. a sidewalk), excluded ones never. ``closures`` are JSON files (a path or a
-    list) of closed segments, besides the bundled ones. ``max_sac`` (1-6) skips harder trails.
+    list) of closed segments, besides the bundled ones. ``max_sac`` (1-6) skips harder trails, and
+    ``marked_only`` herd paths and other informal or unmarked ways. ``quiet`` silences progress output.
 
     Raises OptionError (a ValueError) for invalid options, and VertmaxxerError if no route fits or a data source
     fails.
     """
-    for name, x in dict(distance_mi=distance_mi, time_h=time_h, pace=pace, gap=gap).items():
-        if x is not None and not x > 0:
-            raise OptionError(f"{name} must be positive")
+    for name, x in dict(distance_mi=distance_mi, time_h=time_h, pace=pace, gap=gap, time_limit_s=time_limit_s,
+                        seg_max_m=seg_max_m, workers=workers).items():
+        if x is not None and not (x > 0 and math.isfinite(x)):
+            raise OptionError(f"{name} must be a positive number")
+    for name, x, hi in (("max_road_fraction", max_road_fraction, 1), ("min_loop_frac", min_loop_frac, 0.99),
+                        ("min_loop_mi", min_loop_mi, np.inf), ("trailhead_roads_m", trailhead_roads_m, np.inf)):
+        if not 0 <= x <= hi:
+            raise OptionError(f"{name} must be between 0 and {hi}")
     budget_flat = None  # grade-adjusted (flat-equivalent) m, with a time at a GAP
     if time_h is not None:
         if distance_mi is not None:
@@ -230,8 +267,13 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
     if topology not in core.TOPOLOGIES:
         raise OptionError(f"unknown topology {topology!r}; one of {', '.join(core.TOPOLOGIES)}")
     shape = core.TOPOLOGIES[topology]
-    starts_ll = _points(start)
-    ends_ll = _points(end) if end is not None else []
+    starts_ll = _points(start, dem)
+    ends_ll = _points(end, dem) if end is not None else []
+    if any(core._haversine(*p, *q) < 200 for p in ends_ll for q in starts_ll):
+        raise OptionError("the end is at the start: for a route back to the start, use a loop or another closed shape")
+    if shape["loops"] and distance_mi < min_loop_mi:
+        raise OptionError(f"a {topology} needs loops of at least {min_loop_mi:g} mi (min_loop_mi), more than the "
+                          f"{distance_mi:.2f} mi allowed")
     p2p = bool(ends_ll) or end_trailheads
     if ends_ll and end_trailheads:
         raise OptionError("give either end or end_trailheads")
@@ -284,12 +326,12 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
         osm = dict(osm, elements=[el for el in osm["elements"] if not (el["type"] == "way" and el["id"] in exclude)])
     # A start nearer a street than a trail starts on the street; the walk from it to the trails is a road walk.
     street = (list(range(len(anchors))) if roads_only
-              else [k for k, p in enumerate(starts_ll) if _nearer_street(osm, p)])
+              else [k for k, p in enumerate(anchors) if _nearer_street(osm, p)])
     missing = include - {el["id"] for el in osm["elements"] if el["type"] == "way"}
     if missing:
         print(f"Warning: {len(missing)} included ways aren't in OpenStreetMap: {', '.join(map(str, sorted(missing)))}")
     edges, anchor_ids = core.build_graph(osm, True, max_sac, anchors, extra_ids=heads, closed=closed, snap_roads=street,
-                                         include=include)
+                                         include=include, marked_only=marked_only)
     if any_roads:  # major roads only where they meet others
         edges = [e for e in edges if not e.get("major")]
     else:  # trails, and road walks between them; crossings and the start's own roads are free
@@ -298,6 +340,7 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
         minor = [e for e in edges if not e.get("major")]
         walks = {id(e) for e in core.road_connectors(minor, max_road_fraction * budget)}
         walks |= core.trailhead_roads(edges, [anchor_ids[k] for k in street], max_road_fraction * budget)
+        free |= core.trailhead_roads(edges, anchor_ids[len(starts_ll):], trailhead_roads_m)  # an end's lot, too
         edges = [dict(e, roadpt=np.zeros_like(e["roadpt"])) if id(e) in free else e
                  for e in edges if id(e) in free | walks]
     if paved_only:
@@ -319,7 +362,7 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
     if shape["spurs"] != 0:
         edges = _tidy(edges, set(starts) | set(ends or ()))
 
-    hint = None if budget_flat or ends else _seed(edges, starts[0], budget, shape, min_loop_mi * MI_TO_M, min_loop_frac,
+    hint = None if budget_flat or ends or minimize else _seed(edges, starts[0], budget, shape, min_loop_mi * MI_TO_M, min_loop_frac,
                                                   None if any_roads else max_road_fraction)
     m, s, t, proven = core.solve(edges, starts, ends, budget_flat or budget, shape, min_loop_mi * MI_TO_M, time_limit_s, workers,
                                  verbose, min_loop_frac=min_loop_frac, road_time_frac=road_time_frac,
@@ -348,11 +391,16 @@ class Spurred:
 
 
 def read_gpx(path):
-    """Track (or route) points of a GPX file, as an (n, 2) array of lat, lon."""
-    t = open(path).read()
-    p = re.findall(r'<(?:trkpt|rtept)[^>]*lat="([-\d.]+)"[^>]*lon="([-\d.]+)"', t)
-    p = p or [(a, b) for b, a in re.findall(r'<(?:trkpt|rtept)[^>]*lon="([-\d.]+)"[^>]*lat="([-\d.]+)"', t)]
-    return np.array(p, float)
+    """Track points of a GPX file (or its route points, if it has no track), as an (n, 2) array of lat, lon."""
+    try:
+        root = ET.parse(path).getroot()
+    except FileNotFoundError:
+        raise VertmaxxerError(f"No such file: {path}")
+    except (ET.ParseError, UnicodeDecodeError, IsADirectoryError) as err:
+        raise VertmaxxerError(f"{path} isn't a GPX file: {err}")
+    pts = {tag: [(float(e.get("lat")), float(e.get("lon"))) for e in root.iter() if e.tag.split("}")[-1] == tag
+                 and e.get("lat") is not None and e.get("lon") is not None] for tag in ("trkpt", "rtept")}
+    return np.array(pts["trkpt"] or pts["rtept"], float).reshape(-1, 2)
 
 
 def _along(pts):
@@ -400,6 +448,7 @@ def _match(edges, pts, tol, start, end):
     return np.minimum(counts, 2)
 
 
+@_quietly
 def spurify(track, extra_mi=None, budget_mi=None, *, time_limit_s=60.0, workers=8, match_m=15.0, summit_m=60.0,
             dem="3dep"):
     """Add out-and-back side trips to named summits to a route, keeping the route itself.
@@ -411,6 +460,9 @@ def spurify(track, extra_mi=None, budget_mi=None, *, time_limit_s=60.0, workers=
     """
     if (extra_mi is None) == (budget_mi is None):
         raise OptionError("give one of extra_mi or budget_mi")
+    for name, x in dict(extra_mi=extra_mi, budget_mi=budget_mi).items():
+        if x is not None and not (x >= 0 and math.isfinite(x)):
+            raise OptionError(f"{name} must be a non-negative number")
     pts = read_gpx(track) if isinstance(track, (str, os.PathLike)) else np.asarray(track, float)
     if len(pts) < 2:
         raise VertmaxxerError("The route has no track points")
@@ -427,7 +479,10 @@ def spurify(track, extra_mi=None, budget_mi=None, *, time_limit_s=60.0, workers=
     peaks = {x["id"]: (x["lat"], x["lon"], x["tags"]["name"]) for x in core._overpass(q, "peaks")["elements"]}
     anchors = [tuple(pts[0]), tuple(pts[-1])] + [(la, lo) for la, lo, _ in peaks.values()]
     closures = core.load_closures(sorted(core.CLOSURES_DIR.glob("*.json")))
-    raw, ids = core.build_graph(osm, True, None, anchors, closed=closures, report=2)
+    # The route's ends snap to a street when one is nearer than any trail, as in find_route.
+    street = [k for k in (0, 1) if _nearer_street(osm, anchors[k])]
+    raw, ids = core.build_graph(osm, True, None, anchors, closed=closures, report=1 if closed_loop else 2,
+                                snap_roads=street)
     raw = [e for e in raw if not e.get("major")]  # highways only where they meet other ways
     at = {}
     for e in raw:

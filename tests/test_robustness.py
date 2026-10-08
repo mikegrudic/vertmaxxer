@@ -157,7 +157,7 @@ def test_failed_cache_write_leaves_no_file(monkeypatch, tmp_path):
 
 class Reply:
     def __init__(self, data, status=200):
-        self.data, self.status_code = data, status
+        self.data, self.status_code, self.text = data, status, json.dumps(data)
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -235,7 +235,7 @@ def test_spurify_side_trips_in_route_order(spur_offline, capsys):
     s = vm.spurify(spur_offline, extra_mi=3, time_limit_s=10, workers=2)
     miles = [t.leaves_at_mi for t in s.side_trips]
     assert len(miles) == 2 and miles == sorted(miles)  # the two summits; nothing up and down the parallel way
-    assert capsys.readouterr().out.count("snapped") == 2  # the route's ends, not every peak
+    assert capsys.readouterr().out.count("snapped") == 1  # the closed route's start, not every peak
 
 
 def test_spurify_budget_below_the_route_is_a_plain_error(spur_offline):
@@ -463,3 +463,193 @@ def test_moffatt_drive_is_closed():
     closed = core.load_closures(sorted(core.CLOSURES_DIR.glob("*.json")))
     drive = json.load(open(core.CLOSURES_DIR / "moffatt_healy_drive_2026-10.json"))["closed_segments"]
     assert drive and all(frozenset(s) in closed for s in drive)
+
+
+# ---------------------------------------------------------------- adversarial round 1
+
+def test_overpass_refusals(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(core, "_DEAD_MIRRORS", set())
+    slept, urls = [], []
+    monkeypatch.setattr(core.time, "sleep", slept.append)
+
+    def post(url, *a, **k):
+        urls.append(url)
+        return Reply({}, 504 if url == core.OVERPASS_URLS[0] else 403)
+    monkeypatch.setattr(core.requests, "post", post)
+    with pytest.raises(vm.VertmaxxerError):
+        core._overpass("q1", "osm")
+    assert urls.count(core.OVERPASS_URLS[1]) == 1  # a mirror that refuses us isn't asked again
+    slept.clear()
+    monkeypatch.setattr(core.requests, "post", lambda *a, **k: Reply({}, 400))
+    with pytest.raises(vm.VertmaxxerError, match="rejected"):
+        core._overpass("q2", "osm")
+    assert not slept
+
+
+def test_cached_download_covering_a_smaller_query_is_reused(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "CACHE_DIR", tmp_path)
+    data = osm([(1, PTS, PATH)])
+    monkeypatch.setattr(core.requests, "post", lambda *a, **k: Reply(data))
+    assert core.fetch_osm([(44.0, -72.0)], 5000, True) == data
+
+    def no_network(*a, **k):
+        raise AssertionError("downloaded again")
+    monkeypatch.setattr(core.requests, "post", no_network)
+    assert core.fetch_osm([(44.001, -72.0)], 3000, True) == data  # inside the first circle
+    assert core.fetch_osm([(44.0, -72.0)], 5000, False) == data  # trails only: the download had them
+    with pytest.raises(AssertionError):
+        core.fetch_osm([(44.0, -72.0)], 6000, True)  # bigger: needs a new download
+
+
+def test_empty_overpass_answers_are_not_cached(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(core.requests, "post", lambda *a, **k: Reply({"elements": []}))
+    core._overpass("q", "osm")
+    assert not list(tmp_path.glob("osm_*"))
+
+
+def test_end_at_the_start_is_an_option_error():
+    with pytest.raises(vm.OptionError, match="loop"):
+        vm.find_route((44.0, -72.0), 5, "traverse", end=(44.0005, -72.0))
+
+
+def test_end_on_a_street_snaps_to_the_street(offline, capsys):
+    street = [(PTS[-1][0], -72.003), PTS[-1], (PTS[-1][0], -71.9985), (PTS[-1][0], -71.997)]  # from the trail's end
+    offline(osm([(1, PTS, PATH), (2, street, {"highway": "residential", "name": "North St"})]))
+    run(PTS[0], 4, "traverse", end=(PTS[-1][0], -71.9985))
+    assert "(North St)" in capsys.readouterr().out
+
+
+def test_far_points_warn_or_fail(offline, capsys):
+    offline(osm([(1, PTS, PATH)]))
+    run((PTS[0][0] - 300 / M_PER_DEG, -72.0), 4, "out-and-back")
+    assert "m from the nearest usable way" in capsys.readouterr().out
+    with pytest.raises(vm.VertmaxxerError, match="within 1 km"):
+        run((PTS[0][0] - 2000 / M_PER_DEG, -72.0), 4, "out-and-back")
+
+
+def test_spurify_starts_on_the_street(spur_offline, monkeypatch, capsys):
+    data, track, peaks = spur_network()
+    lot = (43.9992, -72.0)
+    east = (lot[0], -71.9995)  # where a path leaves the street for the loop, 40 m east of the lot
+    street = [(lot[0], -72.0005), lot, east]  # a street 90 m south of the loop's start
+    extra = osm([(9, street, {"highway": "residential", "name": "Lot Rd"}), (10, [east, (44.0, -72.0)], PATH)])
+    ids = {e["id"] for e in data["elements"] if e["type"] == "node"}
+    data["elements"] += [dict(e, id=e["id"] + 10**6) if e["type"] == "node" else
+                         dict(e, nodes=[n + 10**6 for n in e["nodes"]]) for e in extra["elements"]]
+    # the connector's north end must be the loop's own start node
+    trail_start = next(e["id"] for e in data["elements"] if e["type"] == "node" and (e["lat"], e["lon"]) == (44.0, -72.0))
+    for e in data["elements"]:
+        if e["type"] == "way" and e["id"] == 10:
+            e["nodes"][-1] = trail_start
+    monkeypatch.setattr(core, "fetch_osm", lambda *a, **k: data)
+    start = np.array([list(lot)])
+    s = vm.spurify(np.vstack([start, track, start]), extra_mi=1, time_limit_s=10, workers=2)
+    assert core._haversine(s.route.lat[0], s.route.lon[0], *lot) < 5  # starts at the lot, not on the path 40 m off
+
+
+@pytest.mark.parametrize("body, expect", [
+    ("<gpx><trk><trkseg><trkpt lat='42.0' lon='-74.0'/><trkpt lat='42.1' lon='-74.1'/></trkseg></trk></gpx>", 2),
+    ('<gpx><trk><trkseg><trkpt lat="42" lon="-74"/><trkpt lon="-74.1" lat="42.1"/><trkpt lat="42.2" lon="-74.2"/>'
+     '</trkseg></trk></gpx>', 3),
+    ('<gpx><trk><trkseg><trkpt lat="4.2e1" lon="-7.4e1"/><trkpt lat="42.1" lon="-74.1"/></trkseg></trk></gpx>', 2),
+    ('<gpx><rte><rtept lat="1" lon="1"/></rte><trk><trkseg><trkpt lat="42" lon="-74"/><trkpt lat="42.1" lon="-74"/>'
+     '</trkseg></trk></gpx>', 2),
+])
+def test_read_gpx_formats(tmp_path, body, expect):
+    p = tmp_path / "r.gpx"
+    p.write_text(body)
+    pts = vm.read_gpx(p)
+    assert len(pts) == expect and pts[0][0] == 42.0
+
+
+def test_read_gpx_bad_files(tmp_path):
+    p = tmp_path / "x.gpx"
+    p.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00")
+    with pytest.raises(vm.VertmaxxerError):
+        vm.read_gpx(p)
+    with pytest.raises(vm.VertmaxxerError):
+        vm.read_gpx(tmp_path / "missing.gpx")
+
+
+def test_minimize_doesnt_start_from_the_hilliest_route(offline, monkeypatch):
+    A, approach, net = tri_and_approach()
+    offline(net)
+
+    def seed(*a, **k):
+        raise AssertionError("seeded")
+    monkeypatch.setattr(api, "_seed", seed)
+    with pytest.raises(vm.VertmaxxerError):  # no lollipop fits; the point is that no seed was tried
+        run(approach[-1], 8.5, "lollipop", minimize=True)
+
+
+def test_cli_checks_outputs_before_solving(monkeypatch, tmp_path):
+    def solve(*a, **k):
+        raise AssertionError("solved")
+    monkeypatch.setattr(cli, "find_route", solve)
+    for extra in (["-o", str(tmp_path / "no" / "x.gpx")], ["--plot", str(tmp_path / "p.xyz")]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["--start", "44,-72", "--distance", "5"] + extra)
+        assert e.value.code == 2
+
+
+def test_unmarked_ways():
+    herd = {"highway": "path", "name": "Herd Path", "informal": "yes"}
+    data = osm([(1, PTS[:5], PATH), (2, PTS[4:9], herd)])
+    names = {n for e in core.build_graph(data, True, None, [PTS[0]])[0] for n in e["names"]}
+    assert "Herd Path (unmarked)" in names
+    ways = {e["way"] for e in core.build_graph(data, True, None, [PTS[0]], marked_only=True)[0]}
+    assert ways == {1}
+
+
+@pytest.mark.parametrize("kw", [dict(start=(float("nan"), -72.0)), dict(start=(141.4, -73.9)),
+                                dict(start=(-73.96568, 41.42698)), dict(distance_mi=float("inf")),
+                                dict(seg_max_m=0), dict(time_limit_s=-5), dict(workers=-1),
+                                dict(max_road_fraction=-0.5), dict(min_loop_frac=1.5),
+                                dict(distance_mi=0.3, topology="loop")])
+def test_bad_inputs_are_option_errors(kw):
+    kw = dict(dict(start=(44.0, -72.0), distance_mi=5), **kw)
+    with pytest.raises(vm.OptionError):
+        vm.find_route(**kw)
+
+
+def test_start_as_text(offline):
+    offline(osm([(1, PTS, PATH)]))
+    assert run(f"{PTS[0][0]},{PTS[0][1]}", 2, "out-and-back").shape == "out-and-back"
+
+
+def test_cli_road_fraction_with_roads():
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--start", "44,-72", "--distance", "5", "--roads", "--max-road-fraction", "0"])
+    assert e.value.code == 2
+
+
+def test_spurify_negative_extra():
+    with pytest.raises(vm.OptionError):
+        vm.spurify(np.array([[44.0, -72.0], [44.01, -72.0]]), extra_mi=-2)
+
+
+def test_gpx_names_are_escaped(tmp_path):
+    p = tmp_path / "r.gpx"
+    core.write_gpx(p, dict(lat=[44.0, 44.1], lon=[-72.0, -72.0], z_raw=[1.0, 2.0]), "Burroughs & Slide <loop>")
+    import xml.etree.ElementTree as ET
+    assert ET.parse(p).getroot().find(".//{*}name").text == "Burroughs & Slide <loop>"
+
+
+def test_spurify_output_names(monkeypatch, tmp_path):
+    written = []
+
+    class Fake:
+        route = type("R", (), dict(write_gpx=lambda self, path, name: written.append((path, name)), gain_ft=0,
+                                   distance_mi=1, proven=False))()
+        side_trips, base_gain_ft, base_distance_mi = [], 0, 1
+    monkeypatch.setattr(cli, "spurify", lambda *a, **k: Fake())
+    cli.spurify_main([str(tmp_path / "Route.GPX"), "--extra", "1"])
+    cli.spurify_main([str(tmp_path / "a.gpx"), "--extra", "1", "-o", str(tmp_path / "out")])
+    assert written == [(str(tmp_path / "Route_spurred.gpx"), "Route_spurred"), (str(tmp_path / "out"), "out")]
+
+
+def test_short_legs_fold_into_the_one_before():
+    legs = [["Trail A", 1000], ["service", 10], ["footway", 5], ["Trail A", 200], ["Trail B", 500]]
+    assert cli._legs(legs) == [["Trail A", 1215], ["Trail B", 500]]

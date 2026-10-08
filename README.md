@@ -7,7 +7,7 @@ OpenStreetMap trail network, and writes a GPX file.
 vertmaxxer --start 42.03545,-74.35961 --distance 16 --topology loop
 ```
 
-Elevation comes from USGS 3DEP, so it works in the US only. The solver uses OR-Tools CP-SAT; the model is
+Elevation comes from USGS 3DEP, which covers the US; elsewhere, add `--dem terrarium` (AWS terrain tiles, worldwide). The solver uses OR-Tools CP-SAT; the model is
 described at the top of `src/vertmaxxer/core.py`.
 
 ## Install
@@ -18,8 +18,9 @@ pip install "vertmaxxer[plot] @ git+https://github.com/mikegrudic/vertmaxxer"
 
 or, from a clone, `pip install -e ".[plot,test]"`. Python 3.10 or later; `[plot]` adds matplotlib for `--plot`.
 
-Trail and elevation downloads are cached in `~/.cache/vertmaxxer` (set `VERTMAXXER_CACHE` to move it), so a second
-run near the same start is much faster.
+Trail and elevation downloads are cached in `~/.cache/vertmaxxer` (set `VERTMAXXER_CACHE` to move it). A later
+run from the same start at the same or a shorter distance reuses the trail download; a longer one, or a start
+outside the area already downloaded, fetches again.
 
 ## Vertmaxx a route
 
@@ -40,7 +41,13 @@ run near the same start is much faster.
    | `figure-8`     | Two loops through one crossing point, nothing repeated |
    | `dumbbell`     | A loop, a repeated connector, a second loop, then back |
    | `traverse`     | Point to point; needs `--end LAT,LON` or `--end-trailheads` |
+   | `double-lollipop` | A stem to two separate loops |
+   | `loop-spurs`   | One loop plus out-and-back side trips |
+   | `spurred`      | Any closed route with out-and-back side trips |
    | `any`          | Whatever climbs most, as long as no trail is run more than twice |
+
+   A route that fits none of these names (from `any`, say) is reported as shape `other`, with its loops and
+   turnarounds described.
 
 4. **Run it:**
 
@@ -50,7 +57,8 @@ run near the same start is much faster.
    ```
 
    It prints the shape, the distance, the gain and a turn-by-turn list of trails, then writes the GPX and, with
-   `--plot`, a map and elevation profile.
+   `--plot`, a map and elevation profile. A lollipop in a big trail network keeps improving for minutes: if the
+   printed bound is far above the gain, run again with `--time-limit 600`.
 
    Another: the Burroughs Range loop from Woodland Valley, over Wittenberg, Cornell and Slide, with a walk on
    Oliverea Road back to the Phoenicia-East Branch Trail:
@@ -73,7 +81,9 @@ By default it plays by the same rules as the published survey:
 - **Turnarounds** (in out-and-backs and `any` routes) each count as 30 ft of climbing given up, so a route
   doesn't nip a few meters up a side street for a few feet. Dead-end road stubs under 100 m (alleys, lot
   entrances) and duplicate short ways are ignored.
-- **Loops** are at least 1 mi and a quarter of the route long, and a traverse ends at least 1 mi from its start.
+- **Loops** are at least 1 mi and a quarter of the route long. A traverse to `--end-trailheads` ends at least 1 mi
+  from its start (`--min-end-dist`); an `--end` at the start is refused, since that's a loop.
+- **Starts and ends** snap to the nearest trail or street, with a warning past 200 m and an error past 1 km.
 
 ### Useful options
 
@@ -96,6 +106,7 @@ By default it plays by the same rules as the published survey:
 | `--end-trailheads` | Finish at whichever trailhead gives the most gain (with `--topology traverse`) |
 | `--closures FILE` | Also avoid the closed segments listed in FILE (format as in `src/vertmaxxer/data/closures/`) |
 | `--max-sac N` | Skip trails rated harder than SAC grade TN (1-6) |
+| `--marked-only` | Skip herd paths and other informal or unmarked ways, which the turn list otherwise labels "(unmarked)" |
 | `--start` again | Give several starts; the solver uses whichever is best |
 
 `vertmaxxer --help` lists the rest.
@@ -184,7 +195,7 @@ print(s.base_gain_ft, s.route.gain_ft, s.side_trips)
 ```
 
 `find_route` and `spurify` raise `vertmaxxer.VertmaxxerError` when no route fits or a data source fails, and
-`ValueError` for inconsistent options.
+`vertmaxxer.OptionError` (a `ValueError`) for invalid options. Both print progress; pass `quiet=True` to silence it.
 
 ## When it fails
 

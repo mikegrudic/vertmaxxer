@@ -48,6 +48,7 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 import networkx as nx
 import numpy as np
@@ -68,9 +69,8 @@ class OptionError(ValueError):
 
 CACHE_DIR = Path(os.environ.get("VERTMAXXER_CACHE", Path.home() / ".cache" / "vertmaxxer"))
 OVERPASS_WAITS = [5, 10, 20, 30, 45, 60, 60, 60]  # s after each failed attempt: about five minutes in all
-OVERPASS_URLS = ["https://overpass-api.de/api/interpreter", "https://overpass.openstreetmap.fr/api/interpreter",
-                 "https://overpass.kumi.systems/api/interpreter"]
-_DEAD_MIRRORS = set()  # mirrors that answered with an internal error this run
+OVERPASS_URLS = ["https://overpass-api.de/api/interpreter", "https://overpass.openstreetmap.fr/api/interpreter"]
+_DEAD_MIRRORS = set()  # mirrors that refused us or answered with an internal error this run
 DEM_URL = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
 DEM_RES_DEG = 1.0 / 3 / 3600  # 1/3 arc-second, ~10 m
 DEM_TILE_PX = 1000  # larger requests often time out at the USGS server
@@ -81,12 +81,13 @@ MI_TO_M = 1609.344
 M_TO_FT = 3.280839895
 RESAMPLE_M = 10.0
 SNAP_M = 500.0
+SNAP_WARN_M, SNAP_FAIL_M = 200.0, 1000.0  # a start or end this far from any usable way is suspect, or an error
 GAP_M = 10.0  # join a trail's dead end to another trail this close: an OSM digitizing gap
 GAP_SAME_NAME_M = 50.0  # ... or to a trail of the same name this close
 GAP_TABLE = Path(__file__).parent / "data" / "strava_GAP_table.dat"
 MIN_TRAIL_NET = 1609.344  # m of connected trail for a network's road crossings to count as access points
 ROAD_GAP_MIN = 0.75  # lowest Strava GAP factor on a plausible road grade; bounds road distance from road time
-HEADERS = {"User-Agent": "vertmaxxer (trail route planner; https://github.com/mikegrudic/vertmaxxer)"}
+HEADERS = {"User-Agent": "vertmaxxer/0.1 (github.com/mikegrudic/vertmaxxer)"}  # the fr mirror refuses some words
 
 TRAIL_HIGHWAYS = ["path", "footway", "track", "bridleway", "steps", "cycleway"]
 ROAD_HIGHWAYS = ["residential", "unclassified", "tertiary", "secondary", "service", "living_street", "road"]
@@ -131,9 +132,9 @@ def _haversine(lat1, lon1, lat2, lon2):
     return 2 * EARTH_RADIUS_M * np.arcsin(np.sqrt(a))
 
 
-def _cached(name, fetch, load, save):
-    """``load`` the cached file, or ``fetch`` and ``save`` it. Files are written whole or not at all, and an
-    unreadable one (e.g. from an older, interrupted run) is fetched again."""
+def _cached(name, fetch, load, save, keep=lambda data: True):
+    """``load`` the cached file, or ``fetch`` and ``save`` it (if ``keep(data)``). Files are written whole or not
+    at all, and an unreadable one (e.g. from an older, interrupted run) is fetched again."""
     path = CACHE_DIR / name
     if path.exists():
         try:
@@ -142,6 +143,8 @@ def _cached(name, fetch, load, save):
             print(f"Cached {name} is unreadable; fetching it again")
             path.unlink()
     data = fetch()
+    if not keep(data):
+        return data
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.stem}.{os.getpid()}.tmp{path.suffix}")  # same suffix: np.save keeps the name
     try:
@@ -162,7 +165,29 @@ def fetch_osm(points, radius_m, roads, way_ids=()):
     )
     if way_ids:
         clauses += f"way(id:{','.join(map(str, sorted(way_ids)))});"
-    return _overpass(f"[out:json][timeout:300];({clauses});(._;>;);out body;", "osm")
+    query = f"[out:json][timeout:300];({clauses});(._;>;);out body;"
+    # A download covering these circles (same road setting, the same extra ways or more) serves too: the graph is
+    # pruned to the budget anyway. Each download's circles are kept beside it.
+    here = CACHE_DIR / f"osm_{_key(query)}.json"
+    if not here.exists():
+        for meta in CACHE_DIR.glob("osm_*.meta.json"):
+            try:
+                m = json.loads(meta.read_text())
+                if (m["roads"] >= bool(roads) and set(m["way_ids"]) >= set(way_ids)
+                        and all(any(_haversine(*p, *q) + radius_m <= m["radius"] for q in m["points"]) for p in points)):
+                    return json.loads(meta.with_name(meta.name.replace(".meta.json", ".json")).read_text())
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+    data = _overpass(query, "osm")
+    if here.exists():
+        meta = dict(points=[list(map(float, p)) for p in points], radius=float(radius_m), roads=bool(roads),
+                    way_ids=sorted(way_ids))
+        here.with_name(here.name.replace(".json", ".meta.json")).write_text(json.dumps(meta))
+    return data
+
+
+def _key(query):
+    return hashlib.sha1(query.encode()).hexdigest()[:16]
 
 
 def _overpass(query, prefix):
@@ -175,8 +200,10 @@ def _overpass(query, prefix):
             url = live[attempt % len(live)]
             try:
                 r = requests.post(url, data={"data": query}, headers=HEADERS, timeout=360)
-                if r.status_code == 500 and url != OVERPASS_URLS[0]:
+                if r.status_code in (403, 500) and url != OVERPASS_URLS[0]:
                     _DEAD_MIRRORS.add(url)
+                if r.status_code == 400:  # the query itself is bad; retrying won't help
+                    raise VertmaxxerError(f"Overpass rejected the query: {r.text.strip()[:300]}")
                 if r.status_code == 429:  # rate limited: give it longer
                     wait = max(wait, 60)
                 r.raise_for_status()
@@ -196,8 +223,8 @@ def _overpass(query, prefix):
                 time.sleep(wait)
         raise VertmaxxerError("All Overpass servers failed; try again later.")
 
-    key = hashlib.sha1(query.encode()).hexdigest()[:16]
-    return _cached(f"{prefix}_{key}.json", fetch, lambda p: json.loads(p.read_text()), lambda p, d: p.write_text(json.dumps(d)))
+    return _cached(f"{prefix}_{_key(query)}.json", fetch, lambda p: json.loads(p.read_text()),
+                   lambda p, d: p.write_text(json.dumps(d)), keep=lambda d: bool(d.get("elements")))
 
 
 def _drivable(tags):
@@ -245,7 +272,14 @@ def _not_a_start(tags):
     return tags.get("highway") in MAJOR_ROADS or tags.get("service") in NOT_ROUTES
 
 
-def _usable(tags, roads, max_sac):
+def _unmarked(tags):
+    """Herd paths and other informal or hard-to-follow ways."""
+    return tags.get("informal") == "yes" or tags.get("trail_visibility") in ("bad", "horrible", "no")
+
+
+def _usable(tags, roads, max_sac, marked_only=False):
+    if marked_only and _unmarked(tags):
+        return False
     foot = tags.get("foot")
     if foot in ("no", "private"):
         return False
@@ -262,7 +296,7 @@ def _usable(tags, roads, max_sac):
 
 
 def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, closed=frozenset(), snap_roads=(),
-                include=frozenset(), report=None):
+                include=frozenset(), report=None, marked_only=False):
     """Split usable ways at junctions (and at ``extra_ids``) and snap anchor points to the nearest way node.
 
     With ``connectors_m`` > 0 (and ``osm`` fetched with roads), road stretches of at most that length
@@ -280,7 +314,7 @@ def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, cl
     ways = [dict(el, tags={"highway": "footway", **el.get("tags", {})}) if el["id"] in include else el
             for el in osm["elements"] if el["type"] == "way"]
     ways = [w for w in ways if "highway" in w.get("tags", {})
-            and (w["id"] in include or _usable(w["tags"], roads, max_sac))]
+            and (w["id"] in include or _usable(w["tags"], roads, max_sac, marked_only))]
     if not ways:
         raise VertmaxxerError("No usable ways found near the trailhead(s).")
     if closed:
@@ -315,6 +349,12 @@ def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, cl
         if report is None or k < report:
             size = "" if on_road else f", in a trail network of {comp_size[way_nodes[i]]} nodes"
             print(f"({lat}, {lon}) snapped {d[i]:.0f} m to OSM node {way_nodes[i]}{tags}{size}")
+        if report is None or k < report:
+            if d[i] > SNAP_FAIL_M:
+                raise VertmaxxerError(f"Nothing walkable within {SNAP_FAIL_M / 1000:g} km of {lat:.5f}, {lon:.5f}")
+            if d[i] > SNAP_WARN_M:
+                print(f"Warning: {lat:.5f}, {lon:.5f} is {d[i]:.0f} m from the nearest usable way; the route starts "
+                      "or ends there instead")
         anchor_ids.append(int(way_nodes[i]))
 
     count = Counter(n for w in ways for n in w["nodes"])
@@ -326,7 +366,7 @@ def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, cl
     edges = []
     for w in ways:
         tags = w.get("tags", {})
-        name = tags.get("name") or tags.get("ref") or tags["highway"]
+        name = (tags.get("name") or tags.get("ref") or tags["highway"]) + (" (unmarked)" if _unmarked(tags) else "")
         seq = w["nodes"]
         start = 0
         for i in range(1, len(seq)):
@@ -1177,6 +1217,7 @@ def classify(edges, m, start, end, min_loop, min_loop_frac=0.0):
 
 
 def write_gpx(path, route, name):
+    name = xml_escape(str(name))
     pts = "\n".join(f'<trkpt lat="{la:.7f}" lon="{lo:.7f}"><ele>{z:.1f}</ele></trkpt>'
                     for la, lo, z in zip(route["lat"], route["lon"], route["z_raw"]))
     Path(path).write_text(

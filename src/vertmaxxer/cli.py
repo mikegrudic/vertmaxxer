@@ -13,6 +13,17 @@ def _latlon(text):
     return lat, lon
 
 
+def _clock(text):
+    """A:BB or A:BB:CC (or a plain number) as A + BB/60 + CC/3600: M:SS in minutes, H:MM in hours."""
+    return sum(float(x) / 60 ** i for i, x in enumerate(text.split(":")))
+
+
+def _fmt(x):
+    """Minutes as M:SS, or hours as H:MM."""
+    m = round(x * 60)
+    return f"{m // 60}:{m % 60:02d}"
+
+
 def _print_route(r):
     print(f"\nShape: {r.shape} ({r.details})")
     if r.end:
@@ -28,7 +39,13 @@ def main(argv=None):
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--start", type=_latlon, action="append", required=True,
                    help="lat,lon of a trailhead; repeat to let the solver choose among several")
-    p.add_argument("--distance", type=float, required=True, help="max route distance (miles)")
+    budget = p.add_mutually_exclusive_group(required=True)
+    budget.add_argument("--distance", type=float, help="max route distance (miles)")
+    budget.add_argument("--time", type=_clock, metavar="H:MM", help="max route time, with --pace or --gap")
+    pace = p.add_mutually_exclusive_group()
+    pace.add_argument("--pace", type=_clock, metavar="M:SS", help="with --time: pace per mile (sets the distance)")
+    pace.add_argument("--gap", type=_clock, metavar="M:SS",
+                      help="with --time: grade-adjusted pace per mile (Strava GAP); climbs and steep descents cost more")
     p.add_argument("--topology", choices=core.TOPOLOGIES, default="lollipop")
     p.add_argument("--end", type=_latlon, action="append",
                    help="lat,lon of a finish for point-to-point routes; repeatable")
@@ -71,7 +88,7 @@ def main(argv=None):
     a = p.parse_args(argv)
 
     try:
-        r = find_route(a.start, a.distance, a.topology, end=a.end, end_trailheads=a.end_trailheads,
+        r = find_route(a.start, a.distance, a.topology, time_h=a.time, pace=a.pace, gap=a.gap, end=a.end, end_trailheads=a.end_trailheads,
                        min_end_dist_mi=a.min_end_dist, any_end=a.any_end, max_road_fraction=a.max_road_fraction,
                        trailhead_roads_m=a.trailhead_roads, roads=a.roads, roads_only=a.roads_only,
                        paved_only=a.paved_only, road_time_frac=a.road_time_frac, ways=a.ways, closures=a.closures,
@@ -83,6 +100,12 @@ def main(argv=None):
     except VertmaxxerError as err:
         raise SystemExit(str(err))
     _print_route(r)
+    if a.gap:
+        back = f"; run in reverse, {_fmt(r.flat_mi(True) * a.gap / 60)}" if r.closed else ""
+        print(f"Grade-adjusted distance {r.flat_mi():.2f} mi: {_fmt(r.flat_mi() * a.gap / 60)} at {_fmt(a.gap)}/mi GAP"
+              f"{back}")
+    elif a.pace:
+        print(f"{_fmt(r.distance_mi * a.pace / 60)} at {_fmt(a.pace)}/mi")
     if a.topology != "any" and r.shape != a.topology:
         print(f"Warning: requested {a.topology} but the route is a {r.shape}")
     r.write_gpx(a.output)

@@ -39,6 +39,16 @@ class Route:
     def gain_raw_ft(self):
         return float(np.sum(np.maximum(0, np.diff(self.z_raw))) * M_TO_FT)
 
+    def flat_mi(self, reverse=False):
+        """Grade-adjusted (flat-equivalent) distance in this route's direction, or the reverse (Strava's GAP model)."""
+        ds = core._haversine(self.lat[:-1], self.lon[:-1], self.lat[1:], self.lon[1:])
+        grade = 100 * np.diff(self.z) / np.maximum(ds, 1e-6)
+        return float(np.sum(ds * core.gap_factor(-grade if reverse else grade)) / MI_TO_M)
+
+    @property
+    def closed(self):
+        return core._haversine(self.lat[0], self.lon[0], self.lat[-1], self.lon[-1]) < 1.0
+
     def write_gpx(self, path, name=None):
         core.write_gpx(path, vars(self), name or f"{self.shape} {self.distance_mi:.1f} mi")
 
@@ -59,7 +69,7 @@ def _points(p):
     return [tuple(map(float, p))] if np.ndim(p) == 1 else [tuple(map(float, q)) for q in p]
 
 
-def find_route(start, distance_mi, topology="lollipop", *, end=None, end_trailheads=False, min_end_dist_mi=1.0,
+def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pace=None, gap=None, end=None, end_trailheads=False, min_end_dist_mi=1.0,
                max_road_fraction=0.1, trailhead_roads_m=400.0, roads=False, roads_only=False, paved_only=False,
                road_time_frac=None, ways=None, closures=(), any_end=False, minimize=False, min_loop_mi=1.0,
                min_loop_frac=0.25, max_sac=None, dem="3dep", smooth_m=50.0, seg_max_m=500.0, time_limit_s=120.0,
@@ -67,7 +77,9 @@ def find_route(start, distance_mi, topology="lollipop", *, end=None, end_trailhe
     """The route with the most climbing (or with ``minimize``, the least) from ``start``.
 
     ``start`` is (lat, lon), or a list of them to let the solver pick. ``distance_mi`` is the most the route may
-    run. ``topology`` is one of ``core.TOPOLOGIES``; ``traverse`` needs ``end`` (a point or list) or
+    run; or give ``time_h`` with ``pace`` (minutes per mile, which just sets the distance) or ``gap`` (grade-adjusted
+    minutes per mile: each stretch then costs its Strava GAP-equivalent flat distance; a stretch run once counts the
+    average of its two directions). ``topology`` is one of ``core.TOPOLOGIES``; ``traverse`` needs ``end`` (a point or list) or
     ``end_trailheads``. Roads: by default up to ``max_road_fraction`` of the distance, besides road crossings and
     the roads within ``trailhead_roads_m`` of the start; ``roads`` allows any amount; ``roads_only`` uses streets
     alone. ``ways`` is a dict (or JSON path) of OSM way ids, {"include": [...], "exclude": [...]}. ``closures`` are
@@ -75,6 +87,22 @@ def find_route(start, distance_mi, topology="lollipop", *, end=None, end_trailhe
 
     Raises VertmaxxerError if no route fits, or a data source fails.
     """
+    budget_flat = None  # grade-adjusted (flat-equivalent) m, with a time at a GAP
+    if time_h is not None:
+        if distance_mi is not None:
+            raise ValueError("give a distance or a time, not both")
+        if (pace is None) == (gap is None):
+            raise ValueError("with a time, give one of pace or gap (minutes per mile)")
+        if pace is not None:
+            distance_mi = time_h * 60 / pace
+        elif minimize:
+            raise ValueError("minimize needs a distance, or a time with a pace")
+        else:
+            budget_flat = time_h * 60 / gap * MI_TO_M
+            g = np.linspace(0, 50, 501)
+            distance_mi = budget_flat / MI_TO_M / np.min((core.gap_factor(g) + core.gap_factor(-g)) / 2)
+    elif distance_mi is None:
+        raise ValueError("give distance_mi, or time_h with pace or gap")
     if topology not in core.TOPOLOGIES:
         raise ValueError(f"unknown topology {topology!r}; one of {', '.join(core.TOPOLOGIES)}")
     shape = core.TOPOLOGIES[topology]
@@ -134,8 +162,11 @@ def find_route(start, distance_mi, topology="lollipop", *, end=None, end_trailhe
     edges = core.contract(core.prune(edges, budget, starts, ends), set(anchor_ids) | set(heads))
     core.add_elevation(edges, smooth_m, dem)
     edges = core.prune(core.subdivide(edges, None if shape["spurs"] == 0 else seg_max_m), budget, starts, ends)
+    if budget_flat is not None:
+        for e in edges:
+            e["cost"] = sum(e["gap"]) / 2
 
-    m, s, t, proven = core.solve(edges, starts, ends, budget, shape, min_loop_mi * MI_TO_M, time_limit_s, workers,
+    m, s, t, proven = core.solve(edges, starts, ends, budget_flat or budget, shape, min_loop_mi * MI_TO_M, time_limit_s, workers,
                                  verbose, min_loop_frac=min_loop_frac, road_time_frac=road_time_frac,
                                  minimize=minimize, max_road_frac=None if any_roads else max_road_fraction,
                                  min_length=0.98 * budget if minimize else 0.0)

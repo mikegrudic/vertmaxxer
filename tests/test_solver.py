@@ -51,3 +51,22 @@ def test_road_fraction_keeps_off_roads():
 def test_budget_too_small_raises():
     with pytest.raises(core.VertmaxxerError):
         loop(network(), 1000)
+
+
+def test_gap_budget_prices_the_climb():
+    """Equal-length triangles: at a grade-adjusted budget, the steeper one costs more and no longer fits."""
+    edges = network()
+    for e in edges:
+        e["cost"] = sum(e["gap"]) / 2
+    steep, gentle = sum(e["cost"] for e in edges[:3]), sum(e["cost"] for e in edges[3:])
+    assert steep > gentle
+    assert loop(edges, (steep + gentle) / 2)[0] == {"AD", "DE", "EA"}
+    assert loop(edges, steep + 1)[0] == {"AB", "BC", "CA"}
+
+
+@pytest.mark.parametrize("kw", [dict(), dict(time_h=1), dict(time_h=1, pace=9, gap=9), dict(distance_mi=5, time_h=1),
+                                dict(time_h=1, gap=9, minimize=True)])
+def test_budget_arguments(kw):
+    import vertmaxxer as vm
+    with pytest.raises(ValueError):
+        vm.find_route((44.0, -72.0), **kw)

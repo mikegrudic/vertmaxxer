@@ -73,6 +73,8 @@ By default it plays by the same rules as the published survey:
 
 | Option | What it does |
 |--------|--------------|
+| `--time H:MM --gap M:SS` | A time budget at a grade-adjusted pace per mile, instead of `--distance` (see below) |
+| `--time H:MM --pace M:SS` | A time budget at a plain pace per mile: the same as `--distance` time ÷ pace |
 | `-o FILE.gpx` | Where to write the route (default `vertmaxxer.gpx`) |
 | `--plot FILE.png` | Also draw a map and elevation profile |
 | `--roads` | Allow roads as well as trails, any amount |
@@ -91,6 +93,21 @@ By default it plays by the same rules as the published survey:
 | `--start` again | Give several starts; the solver uses whichever is best |
 
 `vertmaxxer --help` lists the rest.
+
+### Time instead of distance
+
+`--time 5:00 --gap 13:00` finds the hilliest route you can run in five hours at a 13:00/mi grade-adjusted pace,
+using Strava's grade-adjusted pace (GAP) model: each stretch costs its flat-equivalent distance, so climbs
+and steep descents use up more of the budget than flat trail does.
+
+```
+vertmaxxer --start 42.03545,-74.35961 --time 5:00 --gap 13:00 --topology loop
+```
+
+It prints the route's grade-adjusted distance and time, and for a loop the time run in reverse too. The solver
+doesn't choose a direction for a stretch run once, so it charges the average of the two directions; a loop's
+time in the direction you run it can differ from that by a few percent. GAP is a running model: on very steep
+or technical trail, expect to be slower than it says.
 
 ### Reading the result
 

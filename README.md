@@ -91,13 +91,14 @@ By default it plays by the same rules as the published survey:
 |--------|--------------|
 | `--time H:MM --gap M:SS` | A time budget at a grade-adjusted pace per mile, instead of `--distance` (see below) |
 | `--time H:MM --pace M:SS` | A time budget at a plain pace per mile: the same as `--distance` time ÷ pace |
+| `--metric` / `--imperial` | Kilometers and meters (distances, `--pace` and `--gap` per km, and all output), or miles and feet. The choice is saved (in `~/.config/vertmaxxer/settings.json`) and applies to later runs of both commands until changed |
 | `-o FILE.gpx` | Where to write the route (default `vertmaxxer.gpx`) |
 | `--plot FILE.png` | Also draw a map and elevation profile |
 | `--roads` | Allow roads as well as trails, any amount |
 | `--roads-only` | Roads only, paved or dirt: no trails, tracks, driveways or parking aisles. Highways (OSM primary and trunk) can be crossed but not followed |
 | `--paved-only` | Leave out roads tagged as unpaved (gravel, dirt, ...). Many roads have no surface tag; those count as paved |
 | `--ways FILE` | Add or exclude particular OSM ways (see Road runs below) |
-| `--minimize` | Find the flattest route instead, covering at least 98% of `--distance` |
+| `--minimize` | Find the flattest route instead, covering at least 98% of `--distance`. Works well for loops and road runs; a lollipop in a big trail network may find no route in the time limit |
 | `--max-road-fraction F` | At most this share of the distance on roads (default 0.1; 0 for trails only) |
 | `--trailhead-roads M` | Walkable roads around the start, in meters (default 400; 0 for none) |
 | `--any-end` | Allow traverses to end on the Mount Washington Auto Road, at its summit, or on Breakneck Road |
@@ -178,7 +179,8 @@ junctions and the two build their networks with different junctions.
 
 ## Python API
 
-The command-line tools are thin wrappers over two functions:
+The command-line tools are thin wrappers over two functions. Their numbers are in miles and feet (`Route` also has
+`distance_km` and `gain_m`):
 
 ```python
 import vertmaxxer as vm

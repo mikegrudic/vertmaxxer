@@ -13,6 +13,13 @@ from vertmaxxer import api, cli, core
 M_PER_DEG = 111195.0
 
 
+@pytest.fixture(autouse=True)
+def settings(monkeypatch, tmp_path):
+    """Each test with its own (empty) saved settings, and imperial output."""
+    monkeypatch.setenv("VERTMAXXER_CONFIG", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(core, "METRIC", False)
+
+
 class FakeDEM:  # elevation rises 50 m per km northward
     def __init__(self, *a, **k):
         pass
@@ -743,3 +750,66 @@ def test_loop_from_a_stub_walks_out_to_the_loop(offline):
     r = run(approach[20], 5, "loop")  # 1 km down the approach
     assert r.shape == "loop" and "access path" in r.details
     assert core._haversine(r.lat[0], r.lon[0], *approach[20]) < 5 and r.closed
+
+
+# ---------------------------------------------------------------- metric
+
+def test_metric_inputs_reach_the_api_in_miles(monkeypatch):
+    got = {}
+
+    def capture(start, distance_mi=None, topology=None, **k):
+        got.update(k, distance_mi=distance_mi)
+        raise vm.VertmaxxerError("stop")
+    monkeypatch.setattr(cli, "find_route", capture)
+    with pytest.raises(SystemExit):
+        cli.main(["--start", "44,-72", "--distance", "10", "--metric"])
+    assert got["distance_mi"] == pytest.approx(10 / 1.609344) and got["min_loop_mi"] == 1.0
+    with pytest.raises(SystemExit):
+        cli.main(["--start", "44,-72", "--time", "1:00", "--gap", "6:00", "--metric", "--min-loop", "2"])
+    assert got["gap"] == pytest.approx(6 * 1.609344) and got["min_loop_mi"] == pytest.approx(2 / 1.609344)
+
+
+def test_metric_route_output(capsys):
+    r = type("R", (), dict(shape="loop", details="10.00 km", end=None, distance_mi=10 / 1.609344, gain_ft=1000 * core.M_TO_FT,
+                           gain_raw_ft=1100 * core.M_TO_FT, proven=True, legs=[["Long Trail", 10000.0]]))()
+    cli._print_route(r, cli._Units(True))
+    out = capsys.readouterr().out
+    assert "Distance 10.00 km, gain 1,000 m (unsmoothed 1,100 m), 100 m/km" in out and "10.00 km  Long Trail" in out
+
+
+def test_metric_spurify(monkeypatch, tmp_path, capsys):
+    got = {}
+
+    class Fake:
+        route = type("R", (), dict(write_gpx=lambda self, path, name: None, gain_ft=2000 * core.M_TO_FT,
+                                   distance_mi=12 / 1.609344, proven=False))()
+        side_trips = [vm.SideTrip(leaves_at_mi=1 / 1.609344, length_mi=2 / 1.609344, gain_ft=1000 * core.M_TO_FT,
+                                  summits=["Peak"])]
+        base_gain_ft, base_distance_mi = 1000 * core.M_TO_FT, 10 / 1.609344
+
+    def fake(gpx, extra, budget, **k):
+        got.update(extra=extra)
+        return Fake()
+    monkeypatch.setattr(cli, "spurify", fake)
+    cli.spurify_main([str(tmp_path / "r.gpx"), "--extra", "2", "--metric"])
+    out = capsys.readouterr().out
+    assert got["extra"] == pytest.approx(2 / 1.609344)
+    assert "1.00 km       2.00 km   1,000 m      500  Peak" in out and "After: 2,000 m over 12.00 km (+1,000 m)" in out
+
+
+def test_metric_setting_sticks_until_imperial(monkeypatch, capsys):
+    got = []
+
+    def capture(start, distance_mi=None, topology=None, **k):
+        got.append(distance_mi)
+        raise vm.VertmaxxerError("stop")
+    monkeypatch.setattr(cli, "find_route", capture)
+    for flags in (["--metric"], [], ["--imperial"], []):
+        with pytest.raises(SystemExit):
+            cli.main(["--start", "44,-72", "--distance", "10"] + flags)
+    km = pytest.approx(10 / 1.609344)
+    assert got == [km, km, 10, 10]
+    assert "from now on" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--start", "44,-72", "--distance", "10", "--metric", "--imperial"])
+    assert e.value.code == 2

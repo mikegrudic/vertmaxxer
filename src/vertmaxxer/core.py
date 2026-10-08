@@ -81,6 +81,20 @@ EARTH_RADIUS_M = 6371000.0
 MI_TO_M = 1609.344
 M_TO_FT = 3.280839895
 RESAMPLE_M = 10.0
+METRIC = False  # print distances in km and climbing in m (the CLI's --metric); returned numbers stay in mi and ft
+
+
+def show_d(*meters):
+    """Distances (m) as printed: "12.34 mi", or "1.20 + 3.40 km" for several."""
+    k = 1000.0 if METRIC else MI_TO_M
+    return " + ".join(f"{m / k:.2f}" for m in meters) + (" km" if METRIC else " mi")
+
+
+def show_z(meters):
+    """Climbing (m) as printed."""
+    return f"{meters:,.0f} m" if METRIC else f"{meters * M_TO_FT:,.0f} ft"
+
+
 SNAP_M = 500.0
 SNAP_WARN_M, SNAP_FAIL_M = 200.0, 1000.0
 STREET_SNAP_M = 100.0  # a street start snaps to the biggest street network this close (not a cut-off lane)
@@ -1117,7 +1131,7 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
             md.ClearHints()
             for i, val in enumerate(fs.response_proto.solution):
                 md.AddHint(md.get_int_var_from_proto_index(i), val)
-            print(f"  hint completed: gain {fs.ObjectiveValue() / 20 * M_TO_FT:,.0f} ft")
+            print(f"  hint completed: gain {show_z(fs.ObjectiveValue() / 20)}")
         else:
             print("  hint could not be completed; using it on the edges only")
 
@@ -1129,31 +1143,30 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
 
     turn_units = round(20 * turn_penalty)
 
-    def gain_ft(value, sol):
+    def gain_m(value, sol):
         """The route's gain from the objective, without the turnaround costs it includes."""
         if turn_units:
             value += (-1 if minimize else 1) * turn_units * sum(sol.Value(x) for x in leaves)
-        return value / 20 * M_TO_FT
+        return value / 20
 
     class Progress(cp_model.CpSolverSolutionCallback):
         best = None
 
         def on_solution_callback(self):
-            gain = gain_ft(self.ObjectiveValue(), self)
+            gain = gain_m(self.ObjectiveValue(), self)
             if _improved(gain, self.best, minimize):
-                score = f"score {self.ObjectiveValue() / 20 * M_TO_FT:,.0f} ft, " if turn_units else ""
-                print(f"  {time.time() - t0:6.1f} s  gain {gain:7,.0f} ft  "
-                      f"({score}bound {self.BestObjectiveBound() / 20 * M_TO_FT:,.0f} ft)")
+                score = f"score {show_z(self.ObjectiveValue() / 20)}, " if turn_units else ""
+                print(f"  {time.time() - t0:6.1f} s  gain {show_z(gain):>9s}  "
+                      f"({score}bound {show_z(self.BestObjectiveBound() / 20)})")
                 self.best = gain
 
     print(f"Solving: {N} nodes, {E} edges, {time_limit:.0f} s limit, {workers} workers")
     status = solver.Solve(md, Progress())
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise VertmaxxerError(_no_route(solver.StatusName(status), time_limit))
-    score = (f"score {solver.ObjectiveValue() / 20 * M_TO_FT:,.0f} ft (gain less the turnaround costs), "
-             if turn_units else "")
-    print(f"  {solver.StatusName(status).lower()}: gain {gain_ft(solver.ObjectiveValue(), solver):,.0f} ft, "
-          f"{score}bound {solver.BestObjectiveBound() / 20 * M_TO_FT:,.0f} ft")
+    score = f"score {show_z(solver.ObjectiveValue() / 20)} (gain less the turnaround costs), " if turn_units else ""
+    print(f"  {solver.StatusName(status).lower()}: gain {show_z(gain_m(solver.ObjectiveValue(), solver))}, "
+          f"{score}bound {show_z(solver.BestObjectiveBound() / 20)}")
 
     m = np.array([solver.Value(a[e]) + 2 * solver.Value(b[e]) for e in range(E)])
     start = starts[next(i for i in range(len(S)) if solver.Value(s[i]))]
@@ -1212,30 +1225,30 @@ def classify(edges, m, start, end, min_loop, min_loop_frac=0.0):
         (once if m[i] == 1 else twice).add_edge(e["u"], e["v"], length=e["length"])
         foot.add_edge(e["u"], e["v"])
 
-    def miles(G):
-        return sum(d["length"] for *_, d in G.edges(data=True)) / MI_TO_M
+    def length(G):
+        return sum(d["length"] for *_, d in G.edges(data=True))
 
     rank = foot.number_of_edges() - foot.number_of_nodes() + 1
     if end != start:
         if rank == 0 and twice.number_of_edges() == 0:
-            return "traverse", f"{miles(once):.2f} mi"
-        return "other", f"point-to-point with {rank} loops and {miles(twice):.2f} mi retraced"
+            return "traverse", show_d(length(once))
+        return "other", f"point-to-point with {rank} loops and {show_d(length(twice))} retraced"
     if (rank == 2 and twice.number_of_edges() == 0 and nx.is_connected(once) and once.has_node(start)
             and sorted(d for _, d in once.degree())[-2:] == [2, 4]):
         hub = next(n for n, d in once.degree() if d == 4)
         rest = once.copy()
         rest.remove_node(hub)
-        halves = [sum(d["length"] for u, v, d in once.edges(data=True) if u in c or v in c) / MI_TO_M
+        halves = [sum(d["length"] for u, v, d in once.edges(data=True) if u in c or v in c)
                   for c in nx.connected_components(rest)]
-        halves += [d["length"] / MI_TO_M for u, v, d in once.edges(hub, data=True) if u == v]  # one-edge loops
-        if len(halves) == 2 and min(halves) * MI_TO_M >= 0.995 * min_loop:
-            return "figure-8", "loops " + " + ".join(f"{h:.2f}" for h in sorted(halves, reverse=True)) + " mi"
+        halves += [d["length"] for u, v, d in once.edges(hub, data=True) if u == v]  # one-edge loops
+        if len(halves) == 2 and min(halves) >= 0.995 * min_loop:
+            return "figure-8", "loops " + show_d(*sorted(halves, reverse=True))
     loops = [once.subgraph(c) for c in nx.connected_components(once)]
     simple = all(g.number_of_edges() == g.number_of_nodes() and all(d == 2 for _, d in g.degree()) for g in loops)
     turnarounds = sum(d == 1 and n != start for n, d in foot.degree())
-    retraced = f"{miles(twice):.2f} mi"
-    loop_mi = " + ".join(f"{miles(g):.2f}" for g in sorted(loops, key=lambda g: start not in g)) + " mi"
-    short = [g for g in loops if miles(g) * MI_TO_M < 0.995 * min_loop]  # slack for the solver's whole-meter lengths
+    retraced = show_d(length(twice))
+    loop_mi = show_d(*(length(g) for g in sorted(loops, key=lambda g: start not in g)))
+    short = [g for g in loops if length(g) < 0.995 * min_loop]  # slack for the solver's whole-meter lengths
     if short:
         return "other", f"{len(short)} loop(s) under the minimum ({loop_mi}), {retraced} retraced"
     if simple and rank == len(loops):  # retraced trail only connects, never closes a cycle of its own
@@ -1264,7 +1277,7 @@ def write_gpx(path, route, name):
     )
 
 
-def plot(path, edges, route, anchors):
+def plot(path, edges, route, anchors, metric=False):
     import matplotlib
     matplotlib.use("Agg")
     from matplotlib import pyplot as plt
@@ -1272,14 +1285,15 @@ def plot(path, edges, route, anchors):
     fig, (ax_map, ax_prof) = plt.subplots(1, 2, figsize=(14, 6.5), gridspec_kw=dict(width_ratios=[1.1, 1]))
     for e in edges:
         ax_map.plot(e["lon"], e["lat"], color="tan" if e["road"] else "0.7", lw=0.6, zorder=1)
-    sc = ax_map.scatter(route["lon"], route["lat"], c=route["z_raw"] * M_TO_FT, s=2, cmap="viridis", zorder=2)
+    zf, df, zu, du = (1.0, 1000.0, "m", "km") if metric else (M_TO_FT, MI_TO_M, "ft", "mi")
+    sc = ax_map.scatter(route["lon"], route["lat"], c=route["z_raw"] * zf, s=2, cmap="viridis", zorder=2)
     ax_map.plot(*np.array(anchors)[:, ::-1].T, "r*", ms=12, zorder=3)
     ax_map.set_aspect(1 / math.cos(math.radians(np.mean(route["lat"]))))
-    fig.colorbar(sc, ax=ax_map, label="elevation (ft)", shrink=0.8)
-    ax_prof.plot(route["dist"] / MI_TO_M, route["z_raw"] * M_TO_FT, lw=0.8, label="3DEP")
-    ax_prof.plot(route["dist"] / MI_TO_M, route["z"] * M_TO_FT, lw=1.2, label="smoothed")
-    ax_prof.set_xlabel("distance (mi)")
-    ax_prof.set_ylabel("elevation (ft)")
+    fig.colorbar(sc, ax=ax_map, label=f"elevation ({zu})", shrink=0.8)
+    ax_prof.plot(route["dist"] / df, route["z_raw"] * zf, lw=0.8, label="3DEP")
+    ax_prof.plot(route["dist"] / df, route["z"] * zf, lw=1.2, label="smoothed")
+    ax_prof.set_xlabel(f"distance ({du})")
+    ax_prof.set_ylabel(f"elevation ({zu})")
     ax_prof.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=150)

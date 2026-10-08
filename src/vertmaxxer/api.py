@@ -57,12 +57,20 @@ class Route:
     def closed(self):
         return core._haversine(self.lat[0], self.lon[0], self.lat[-1], self.lon[-1]) < 1.0
 
+    @property
+    def distance_km(self):
+        return float(self.dist[-1] / 1000)
+
+    @property
+    def gain_m(self):
+        return self.gain_ft / M_TO_FT
+
     def write_gpx(self, path, name=None):
         core.write_gpx(path, vars(self), name or f"{self.shape} {self.distance_mi:.1f} mi")
 
-    def plot(self, path):
-        """Map over the searched network, and elevation profile (needs matplotlib)."""
-        core.plot(path, self.edges, vars(self), self.anchors)
+    def plot(self, path, metric=False):
+        """Map over the searched network, and elevation profile (needs matplotlib), in ft and mi or m and km."""
+        core.plot(path, self.edges, vars(self), self.anchors, metric)
 
 
 def _route(edges, m, start, end, proven, min_loop, min_loop_frac, heads=None, anchors=None, access=None):
@@ -73,7 +81,7 @@ def _route(edges, m, start, end, proven, min_loop, min_loop_frac, heads=None, an
         m = np.array(m)
         for k in access[1]:
             m[k] += 2
-        details += f"; plus {sum(edges[k]['length'] for k in access[1]) / MI_TO_M:.2f} mi access path each way"
+        details += f"; plus {core.show_d(sum(edges[k]['length'] for k in access[1]))} access path each way"
         start = end = access[0]
     r = core.assemble(edges, m, start, end)
     return Route(lat=r["lat"], lon=r["lon"], z=r["z"], z_raw=r["z_raw"], dist=r["dist"], legs=r["legs"], shape=shape,
@@ -343,7 +351,7 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
                  if min(core._haversine(h[0], h[1], la, lo) for la, lo in starts_ll) >= min_end_dist_mi * MI_TO_M
                  and (any_end or (h[2].split(" at ")[-1] not in core.EXCLUDED_END_ROADS
                                   and all(core._haversine(h[0], h[1], la, lo) > r for la, lo, r in core.EXCLUDED_ENDS)))}
-        print(f"{len(heads)} trailheads at least {min_end_dist_mi:g} mi from the start")
+        print(f"{len(heads)} trailheads at least {core.show_d(min_end_dist_mi * MI_TO_M)} from the start")
         if not heads:
             raise VertmaxxerError(f"No trailhead within reach is at least {min_end_dist_mi:g} mi from the start; "
                                   "lower --min-end-dist or raise the distance")
@@ -529,7 +537,7 @@ def spurify(track, extra_mi=None, budget_mi=None, *, time_limit_s=60.0, workers=
     closed_loop = core._haversine(*pts[0], *pts[-1]) < 100
     centers = pts[np.linspace(0, len(pts) - 1, max(2, int(L0 / max(reach, 500)) + 2)).astype(int)]
 
-    print(f"Route {L0 / MI_TO_M:.2f} mi; up to {extra / MI_TO_M:.2f} mi more; fetching trails and peaks...")
+    print(f"Route {core.show_d(L0)}; up to {core.show_d(extra)} more; fetching trails and peaks...")
     osm = core.fetch_osm([tuple(c) for c in centers], reach + 200, True)
     q = "[out:json][timeout:180];(" + "".join(
         f'node["natural"="peak"]["name"](around:{reach + 200:.0f},{la:.6f},{lo:.6f});' for la, lo in centers) + ");out;"
@@ -554,11 +562,11 @@ def spurify(track, extra_mi=None, budget_mi=None, *, time_limit_s=60.0, workers=
     base = _match(edges, pts, match_m, start, end)
     L_base = sum(e["length"] * c for e, c in zip(edges, base))
     if abs(L_base - L0) > 0.05 * L0:
-        print(f"Warning: the route matched {L_base / MI_TO_M:.2f} mi of trail for a {L0 / MI_TO_M:.2f} mi track; "
+        print(f"Warning: the route matched {core.show_d(L_base)} of trail for a {core.show_d(L0)} track; "
               "try a larger match distance.", file=sys.stderr)
     budget = budget_mi * MI_TO_M if budget_mi is not None else L_base + extra_mi * MI_TO_M
     if budget < L_base:
-        raise VertmaxxerError(f"The budget is shorter than the route itself ({L_base / MI_TO_M:.2f} mi of trail)")
+        raise VertmaxxerError(f"The budget is shorter than the route itself ({core.show_d(L_base)} of trail)")
     # The route's own turnarounds stay allowed; anything new turns around only at a summit.
     G = nx.MultiGraph()
     for e, c in zip(edges, base):

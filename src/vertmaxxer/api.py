@@ -207,9 +207,10 @@ def _seed(edges, start, budget, shape, min_loop, min_loop_frac, max_road_frac=No
     lollipop, the climbiest (with ``minimize``, the flattest) of a few loops at the ends of short stems; within
     ``max_road_frac`` of road, if given, and at least ``min_length`` long. None for other shapes, or if none fits.
     Dense networks can otherwise take the solver minutes just to find a first route."""
-    if shape["loops"] != 1 or shape["spurs"] != 0 or shape["start"] not in ("loop", "stem"):
-        return None
     rw = 1.0 if max_road_frac is None else 5.0  # keep off roads where they're capped
+    out_and_back = shape["loops"] in (0, None) and shape["spurs"] != 0 and shape["start"] in ("stem", None)
+    if not out_and_back and (shape["loops"] != 1 or shape["spurs"] != 0 or shape["start"] not in ("loop", "stem")):
+        return None
 
     def counts_of(loop, stem=()):
         c = np.zeros(len(edges), int)
@@ -226,6 +227,19 @@ def _seed(edges, start, budget, shape, min_loop, min_loop_frac, max_road_frac=No
         climb = lambda c: float(np.dot(c, [e["var"] for e in edges])) * (-1 if minimize else 1)
         return max(cands, key=climb, default=None)
 
+    if out_and_back:  # also a valid start for "any": the climbiest shortest path there and back
+        if minimize:
+            return None
+        G = _graph(edges, road_weight=rw)
+        if start not in G:
+            return None
+        _, path = nx.single_source_dijkstra(G, start, cutoff=budget / 2 * rw, weight="w")
+        cands = []
+        for X, q in path.items():
+            ks = [G[u][v]["k"] for u, v in zip(q, q[1:])]
+            if ks and 2 * sum(edges[k]["length"] for k in ks) <= budget:
+                cands.append(counts_of((), ks))
+        return best(cands)
     if shape["start"] == "loop":
         lo = max(min_loop, min_length)
         return best(counts_of(ks) for ks in _loops_through(edges, start, lo, budget, road_weight=rw,

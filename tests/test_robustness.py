@@ -930,3 +930,12 @@ def test_traffic_island_doesnt_count_as_a_trail():
                 (2, street, {"highway": "secondary", "name": "5th Avenue"}),
                 (3, park, {"highway": "footway", "name": "Park Path"})])
     assert api._nearer_street(data, p)
+
+
+def test_out_and_back_seed_is_the_climbiest_path_that_fits():
+    e = lambda u, v, L, var, road=0.0: dict(u=u, v=v, length=L, var=var, road_len=road)
+    edges = [e("S", "A", 500, 10), e("A", "B", 500, 80), e("S", "C", 500, 30), e("C", "D", 2000, 400)]
+    oab = core.TOPOLOGIES["out-and-back"]
+    assert list(api._seed(edges, "S", 2500, oab, 1609, 0.25)) == [2, 2, 0, 0]  # S-C-D doesn't fit 2.5 km
+    assert list(api._seed(edges, "S", 6000, oab, 1609, 0.25)) == [0, 0, 2, 2]
+    assert list(api._seed(edges, "S", 6000, core.TOPOLOGIES["any"], 1609, 0.25)) == [0, 0, 2, 2]

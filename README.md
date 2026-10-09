@@ -103,6 +103,7 @@ By default it plays by the same rules as the published survey:
 | `--primary-roads` | Allow running along primary roads (often a town's main street), not just across them |
 | `--max-road-fraction F` | At most this share of the distance on roads (default 0.1; 0 for trails only) |
 | `--trailhead-roads M` | Walkable roads around the start, in meters (default 400; 0 for none) |
+| `--turn-penalty GAIN` | Climb a turnaround must be worth, in feet (meters with `--metric`; default 30, 0 for free). Applies to shapes that can turn back mid-trail (`out-and-back`, `any`, ...); higher keeps routes from nipping up short side trips |
 | `--any-end` | Allow traverses to end on the Mount Washington Auto Road, at its summit, or on Breakneck Road |
 | `--time-limit S` | Seconds to search (default 120; 600 for `figure-8`, `dumbbell` and `double-lollipop`). Long routes and `any` often improve with 600 or more |
 | `--end LAT,LON` | Finish here (with `--topology traverse`) |

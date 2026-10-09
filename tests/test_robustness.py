@@ -617,7 +617,7 @@ def test_unmarked_ways():
                                 dict(start=(-73.96568, 41.42698)), dict(distance_mi=float("inf")),
                                 dict(seg_max_m=0), dict(time_limit_s=-5), dict(workers=-1),
                                 dict(max_road_fraction=-0.5), dict(min_loop_frac=1.5),
-                                dict(distance_mi=0.3, topology="loop")])
+                                dict(distance_mi=0.3, topology="loop"), dict(turn_penalty_ft=-1)])
 def test_bad_inputs_are_option_errors(kw):
     kw = dict(dict(start=(44.0, -72.0), distance_mi=5), **kw)
     with pytest.raises(vm.OptionError):
@@ -1057,3 +1057,29 @@ def test_bundled_links_join_a_road_end_to_a_trail(monkeypatch, tmp_path):
     assert not joined()
     (tmp_path / "kemble.json").write_text(json.dumps({"links": [[a, b]]}))
     assert joined()
+
+
+def test_turn_penalty_reaches_the_solver(offline, monkeypatch):
+    """30 ft per turnaround by default, or as given; shapes that can't turn back mid-trail don't use it."""
+    offline(osm([(1, PTS, PATH)]))
+    got = []
+    real = core.solve
+    monkeypatch.setattr(core, "solve", lambda *a, **k: got.append(k["turn_penalty"]) or real(*a, **k))
+    run(PTS[0], 4, "out-and-back")
+    run(PTS[0], 4, "out-and-back", turn_penalty_ft=100)
+    run(PTS[0], 4, "out-and-back", turn_penalty_ft=0)
+    assert got == [pytest.approx(30 / core.M_TO_FT), pytest.approx(100 / core.M_TO_FT), 0.0]
+
+
+def test_turn_penalty_option_in_the_users_units(monkeypatch):
+    got = {}
+
+    def capture(start, distance_mi=None, topology=None, **k):
+        got.update(k)
+        raise vm.VertmaxxerError("stop")
+    monkeypatch.setattr(cli, "find_route", capture)
+    for flags, ft in ((["--turn-penalty", "50"], 50), (["--turn-penalty", "10", "--metric"], 10 * core.M_TO_FT), ([], 30)):
+        got.clear()
+        with pytest.raises(SystemExit):
+            cli.main(["--start", "44,-72", "--distance", "5"] + flags)
+        assert got.get("turn_penalty_ft", 30) == pytest.approx(ft)

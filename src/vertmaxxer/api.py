@@ -142,7 +142,7 @@ def _nearer_street(osm, point, min_path_m=100.0):
 
 TIME_LIMITS = {"figure-8": 600.0, "dumbbell": 600.0, "double-lollipop": 600.0}  # s; others 120: two loops are hard
 ACCESS_MAX_M = 1609.344  # how far a loop-shaped route may walk out to its loop
-TURN_PENALTY_M = 9.144  # 30 ft: a turnaround must climb at least this much to be worth it
+TURN_PENALTY_FT = 30.0  # the default climb a turnaround must be worth
 
 
 def _collapse_parallel(edges, short_m=100.0):
@@ -337,7 +337,7 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
                end_trailheads=False, min_end_dist_mi=1.0, max_road_fraction=0.1, trailhead_roads_m=400.0, roads=False, roads_only=False, paved_only=False,
                road_time_frac=None, ways=None, closures=(), any_end=False, minimize=False, min_loop_mi=1.0,
                min_loop_frac=0.25, max_sac=None, dem="auto", smooth_m=50.0, seg_max_m=500.0, time_limit_s=None,
-               workers=8, verbose=False, marked_only=False, primary_roads=False):
+               workers=8, verbose=False, marked_only=False, primary_roads=False, turn_penalty_ft=TURN_PENALTY_FT):
     """The route with the most climbing (or with ``minimize``, the least) from ``start``.
 
     ``start`` is (lat, lon), or a list of them to let the solver pick. ``distance_mi`` is the most the route may
@@ -362,7 +362,8 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
         if x is not None and not (x > 0 and math.isfinite(x)):
             raise OptionError(f"{name} must be a positive number")
     for name, x, hi in (("max_road_fraction", max_road_fraction, 1), ("min_loop_frac", min_loop_frac, 0.99),
-                        ("min_loop_mi", min_loop_mi, np.inf), ("trailhead_roads_m", trailhead_roads_m, np.inf)):
+                        ("min_loop_mi", min_loop_mi, np.inf), ("trailhead_roads_m", trailhead_roads_m, np.inf),
+                        ("turn_penalty_ft", turn_penalty_ft, np.inf)):
         if not 0 <= x <= hi:
             raise OptionError(f"{name} must be between 0 and {hi}")
     budget_flat = None  # grade-adjusted (flat-equivalent) m, with a time at a GAP
@@ -506,7 +507,7 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
     floor = 0.98 * budget if minimize else 0.0
     common = dict(min_loop_frac=min_loop_frac, road_time_frac=road_time_frac,
                   max_road_frac=None if any_roads else max_road_fraction,
-                  turn_penalty=TURN_PENALTY_M if shape["spurs"] != 0 else 0.0, start_cost=costs,
+                  turn_penalty=turn_penalty_ft / core.M_TO_FT if shape["spurs"] != 0 else 0.0, start_cost=costs,
                   start_road=access_road, start_gain=access_gain)
     budget_m = budget_flat or budget
     if minimize and hint is None:

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from . import core
-from .api import OptionError, VertmaxxerError, find_route, spurify
+from .api import TURN_PENALTY_FT, OptionError, VertmaxxerError, find_route, spurify
 from .core import M_TO_FT, MI_TO_M
 
 
@@ -70,6 +70,10 @@ class _Units:
         """A distance given in the user's units, in miles."""
         return None if x is None else x * self._m / MI_TO_M
 
+    def to_ft(self, x):
+        """A climb given in the user's units, in feet."""
+        return None if x is None else x * M_TO_FT if self.metric else x
+
     def per_mi(self, minutes):
         """A pace per the user's distance unit, per mile."""
         return None if minutes is None else minutes * MI_TO_M / self._m
@@ -118,7 +122,8 @@ def _remember_units(a):
 FLAGS = {"distance_mi": "--distance", "time_h": "--time", "pace": "--pace", "gap": "--gap", "time_limit_s": "--time-limit",
          "seg_max_m": "--seg-max", "workers": "--workers", "max_road_fraction": "--max-road-fraction",
          "min_loop_frac": "--min-loop-frac", "min_loop_mi": "--min-loop", "trailhead_roads_m": "--trailhead-roads",
-         "extra_mi": "--extra", "budget_mi": "--budget", "end_trailheads": "--end-trailheads", "roads_only": "--roads-only"}
+         "extra_mi": "--extra", "budget_mi": "--budget", "end_trailheads": "--end-trailheads", "roads_only": "--roads-only",
+         "turn_penalty_ft": "--turn-penalty"}
 
 
 def _cli_message(err):
@@ -231,6 +236,8 @@ def main(argv=None):
                    help="elevation: USGS 3DEP (US) or AWS terrain tiles (worldwide); default: 3DEP in the US")
     p.add_argument("--smooth", type=float, default=50.0, help="elevation smoothing e-folding length (m)")
     p.add_argument("--seg-max", type=float, default=500.0, help="turnaround resolution when spurs are allowed (m)")
+    p.add_argument("--turn-penalty", type=float, metavar="GAIN",
+                   help="climb a turnaround must be worth, in ft (m with --metric); default 30 ft, 0 for free turnarounds")
     p.add_argument("--time-limit", type=float,
                    help="solver time limit (s; default 120, or 600 for figure-8, dumbbell and double-lollipop)")
     p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1), help="solver threads")
@@ -267,7 +274,8 @@ def main(argv=None):
                        min_loop_frac=a.min_loop_frac,
                        max_sac=a.max_sac,
                        dem=a.dem, smooth_m=a.smooth, seg_max_m=a.seg_max, time_limit_s=a.time_limit,
-                       workers=a.workers, verbose=a.verbose)
+                       workers=a.workers, verbose=a.verbose,
+                       turn_penalty_ft=TURN_PENALTY_FT if a.turn_penalty is None else u.to_ft(a.turn_penalty))
     except OptionError as err:
         p.error(_cli_message(err))
     except VertmaxxerError as err:

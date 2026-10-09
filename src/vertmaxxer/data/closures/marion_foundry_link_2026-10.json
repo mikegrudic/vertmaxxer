@@ -1,0 +1,30 @@
+{
+ "source": "user report, October 2026: no longer exists on the ground",
+ "description": "The upper part of the unnamed footway from the end of Marion Avenue down to the West Point Foundry Preserve, Cold Spring (OSM way 97522235, from Marion Avenue to its junction with way 298020420), as OSM node pairs",
+ "closed_segments": [
+  [
+   3019341807,
+   1129156779
+  ],
+  [
+   1129156779,
+   1129156780
+  ],
+  [
+   1129156780,
+   1129156781
+  ],
+  [
+   1129156781,
+   1129156782
+  ],
+  [
+   1129156782,
+   1129156784
+  ],
+  [
+   1129156784,
+   983378796
+  ]
+ ]
+}

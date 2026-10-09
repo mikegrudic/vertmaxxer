@@ -1172,7 +1172,8 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
     status = solver.Solve(md, Progress())
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise VertmaxxerError(_no_route(solver.StatusName(status), time_limit))
-    score = f"score {show_z(solver.ObjectiveValue() / 20)} (gain less the turnaround costs), " if turn_units else ""
+    score = (f"score {show_z(solver.ObjectiveValue() / 20)} (gain {'plus' if minimize else 'less'} the turnaround "
+             "costs), " if turn_units else "")
     print(f"  {solver.StatusName(status).lower()}: gain {show_z(gain_m(solver.ObjectiveValue(), solver))}, "
           f"{score}bound {show_z(solver.BestObjectiveBound() / 20)}")
 
@@ -1298,10 +1299,12 @@ def plot(path, edges, route, anchors, metric=False):
     ax_map.plot(*np.array(anchors)[:, ::-1].T, "r*", ms=12, zorder=3)
     ax_map.set_aspect(1 / math.cos(math.radians(np.mean(route["lat"]))))
     fig.colorbar(sc, ax=ax_map, label=f"elevation ({zu})", shrink=0.8)
-    ax_prof.plot(route["dist"] / df, route["z_raw"] * zf, lw=0.8, label="3DEP")
+    ax_prof.plot(route["dist"] / df, route["z_raw"] * zf, lw=0.8, label="unsmoothed")
     ax_prof.plot(route["dist"] / df, route["z"] * zf, lw=1.2, label="smoothed")
     ax_prof.set_xlabel(f"distance ({du})")
     ax_prof.set_ylabel(f"elevation ({zu})")
+    for ax in (ax_map, ax_prof):
+        ax.ticklabel_format(useOffset=False, style="plain")
     ax_prof.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=150)

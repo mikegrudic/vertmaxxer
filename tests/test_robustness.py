@@ -810,7 +810,7 @@ def test_metric_setting_sticks_until_imperial(monkeypatch, capsys):
             cli.main(["--start", "44,-72", "--distance", "10"] + flags)
     km = pytest.approx(10 / 1.609344)
     assert got == [km, km, 10, 10]
-    assert "from now on" in capsys.readouterr().out
+    assert "from now on" in capsys.readouterr().err
     with pytest.raises(SystemExit) as e:
         cli.main(["--start", "44,-72", "--distance", "10", "--metric", "--imperial"])
     assert e.value.code == 2
@@ -939,3 +939,52 @@ def test_out_and_back_seed_is_the_climbiest_path_that_fits():
     assert list(api._seed(edges, "S", 2500, oab, 1609, 0.25)) == [2, 2, 0, 0]  # S-C-D doesn't fit 2.5 km
     assert list(api._seed(edges, "S", 6000, oab, 1609, 0.25)) == [0, 0, 2, 2]
     assert list(api._seed(edges, "S", 6000, core.TOPOLOGIES["any"], 1609, 0.25)) == [0, 0, 2, 2]
+
+
+def test_walks_to_every_trail_network_in_reach_are_free(offline):
+    """A small path network (1.7 km) is nearest to the start; the big one is farther. The walk to the big one is free
+    too, so a route that needs it still fits a 10% road cap."""
+    A = (44.0, -72.0)
+    B = (A[0] + 1000 / M_PER_DEG, A[1])
+    C = (A[0] + 500 / M_PER_DEG, A[1] + 1000 / (M_PER_DEG * np.cos(np.radians(44))))
+    seg = lambda p, q: [(p[0] + f * (q[0] - p[0]), p[1] + f * (q[1] - p[1])) for f in np.linspace(0, 1, 21)]
+    approach = line(*A, 1, south=True)
+    street = line(*approach[-1], 1.5, south=True)
+    start = street[-1]
+    small = [(start[0] + 0.0001 * i, start[1] + 0.003) for i in range(0, 161, 10)]  # 1.8 km north-south, 240 m east
+    offline(osm([(1, seg(A, B) + seg(B, C)[1:] + seg(C, A)[1:], {"highway": "path", "name": "Triangle"}),
+                 (2, approach, {"highway": "path", "name": "Approach"}),
+                 (3, street, {"highway": "residential", "name": "Village Rd"}),
+                 (4, [start, (start[0], start[1] + 0.003)], {"highway": "residential", "name": "Park Rd"}),
+                 (5, small, {"highway": "path", "name": "Park Path"})]))
+    r = run(start, 5.5, "lollipop")
+    assert any(n == "Triangle" for n, _ in r.legs)
+
+
+def test_spurify_reads_an_out_and_back_track(spur_offline, capsys):
+    """Out along the loop's west side to a point between junctions, and back: the base route is that, twice."""
+    track = spur_offline
+    out = track[:31]  # 3/4 of the way up the west side (the side trail leaves at the midpoint)
+    oab = np.vstack([out, out[-2::-1]])
+    s = vm.spurify(oab, extra_mi=0.5, time_limit_s=10, workers=2)
+    data, _, _ = spur_network()
+    nodes = {e["id"]: (e["lat"], e["lon"]) for e in data["elements"] if e["type"] == "node"}
+    trail = np.array([nodes[n] for n in next(w for w in data["elements"] if w["type"] == "way" and w["id"] == 1)["nodes"]])
+    expected = 2 * api._along(trail[:31])[-1] / core.MI_TO_M  # out along the zigzag trail to the turnaround, and back
+    assert abs(s.base_distance_mi - expected) < 0.01 * expected
+    assert "more than twice" not in capsys.readouterr().err
+
+
+
+def test_units_not_saved_by_a_run_with_bad_options(tmp_path, capsys):
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--start", "44,-72", "--distance", "-1", "--metric"])
+    assert e.value.code == 2 and cli._saved_units() is None
+    assert "--distance must be" in capsys.readouterr().err  # the CLI's name, not the API's distance_mi
+
+
+def test_turnaround_of_an_out_and_back_track():
+    out = np.array(line(44.0, -72.0, 3))
+    assert api._turnaround(np.vstack([out, out[-2::-1]])) == len(out) - 1
+    loop = np.array([(44.0 + 0.01 * np.sin(t), -72.0 + 0.01 * np.cos(t)) for t in np.linspace(0, 2 * np.pi, 200)])
+    assert api._turnaround(loop) is None

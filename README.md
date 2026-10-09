@@ -27,7 +27,8 @@ outside the area already downloaded, fetches again.
 1. **Get the start as `lat,lon`.** In Google Maps, right-click the spot and click the coordinates to copy them.
    Maps copies them with a space after the comma: delete it, or quote the pair (`--start "42.03545, -74.35961"`).
    The route starts on the nearest trail or street to that point. From a house, it walks the streets to the
-   nearest trails; that walk counts toward the distance but not toward `--max-road-fraction`. To start on a particular
+   trails (the shortest way to each trail network in reach); those walks count toward the distance but not toward
+   `--max-road-fraction`. To start on a particular
    trail, put the point on it.
 2. **Pick a distance** in miles. This is a maximum; the route can come in shorter if the extra distance would add
    no climbing.

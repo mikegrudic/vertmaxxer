@@ -86,25 +86,43 @@ def _settings_path():
     return Path(os.environ.get("VERTMAXXER_CONFIG") or config / "vertmaxxer" / "settings.json")
 
 
-def _units_setting(a):
-    """The units for this run: --metric or --imperial, which are saved for later runs, or else the saved choice
-    (imperial if there's none)."""
-    path = _settings_path()
+def _saved_units():
     try:
-        saved = json.loads(path.read_text()).get("units")
+        return json.loads(_settings_path().read_text()).get("units")
     except (OSError, ValueError, AttributeError):
-        saved = None
+        return None
+
+
+def _units_setting(a):
+    """The units for this run: --metric or --imperial, or else the saved choice (imperial if there's none)."""
     chosen = "metric" if a.metric else "imperial" if a.imperial else None
-    if chosen and chosen != saved:
+    core.METRIC = (chosen or _saved_units()) == "metric"
+    return _Units(core.METRIC)
+
+
+def _remember_units(a):
+    """Save --metric or --imperial for later runs (once a run has got past its option checks)."""
+    chosen = "metric" if a.metric else "imperial" if a.imperial else None
+    if chosen and chosen != _saved_units():
+        path = _settings_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"units": chosen}))
             other = "--imperial" if chosen == "metric" else "--metric"
-            print(f"Using {chosen} units from now on ({other} switches back; saved in {path})")
+            print(f"Using {chosen} units from now on ({other} switches back; saved in {path})", file=sys.stderr)
         except OSError:
             pass
-    core.METRIC = (chosen or saved) == "metric"
-    return _Units(core.METRIC)
+
+
+# API argument names in error messages, as the CLI's options
+FLAGS = {"distance_mi": "--distance", "time_h": "--time", "pace": "--pace", "gap": "--gap", "time_limit_s": "--time-limit",
+         "seg_max_m": "--seg-max", "workers": "--workers", "max_road_fraction": "--max-road-fraction",
+         "min_loop_frac": "--min-loop-frac", "min_loop_mi": "--min-loop", "trailhead_roads_m": "--trailhead-roads",
+         "extra_mi": "--extra", "budget_mi": "--budget", "end_trailheads": "--end-trailheads", "roads_only": "--roads-only"}
+
+
+def _cli_message(err):
+    return re.sub(r"\b(" + "|".join(FLAGS) + r")\b", lambda m: FLAGS[m.group(1)], str(err))
 
 
 def _add_units(p):
@@ -114,8 +132,10 @@ def _add_units(p):
     g.add_argument("--imperial", action="store_true", help="miles and feet from now on (the default)")
 
 
-def _print_route(r, u=_Units(False)):
+def _print_route(r, u=_Units(False), show_start=False):
     print(f"\nShape: {r.shape} ({r.details})")
+    if show_start:
+        print(f"Starts at {r.lat[0]:.5f}, {r.lon[0]:.5f}")
     if r.end:
         print(f"Ends at {r.end[2]} ({r.end[0]:.5f}, {r.end[1]:.5f})")
     elif not r.closed:
@@ -249,12 +269,12 @@ def main(argv=None):
                        dem=a.dem, smooth_m=a.smooth, seg_max_m=a.seg_max, time_limit_s=a.time_limit,
                        workers=a.workers, verbose=a.verbose)
     except OptionError as err:
-        p.error(str(err))
+        p.error(_cli_message(err))
     except VertmaxxerError as err:
+        _remember_units(a)
         raise SystemExit(str(err))
-    _print_route(r, u)
-    if len(a.start) > 1:
-        print(f"Starts at {r.lat[0]:.5f}, {r.lon[0]:.5f}")
+    _remember_units(a)
+    _print_route(r, u, show_start=len(a.start) > 1)
     if a.gap:
         gap = u.per_mi(a.gap)
         back = f"; run in reverse, {_fmt(r.flat_mi(True) * gap / 60)}" if r.closed else ""
@@ -297,9 +317,11 @@ def spurify_main(argv=None):
         s = spurify(a.gpx, u.to_mi(a.extra), u.to_mi(a.budget), time_limit_s=a.time_limit, workers=a.workers, match_m=a.match_m,
                     summit_m=a.summit_m, dem=a.dem)
     except OptionError as err:
-        p.error(str(err))
+        p.error(_cli_message(err))
     except VertmaxxerError as err:
+        _remember_units(a)
         raise SystemExit(str(err))
+    _remember_units(a)
     _write(lambda path: s.route.write_gpx(path, os.path.splitext(os.path.basename(path))[0]), out)
 
     print(f"\n{'Leaves track':>12s}  {'Out and back':>12s}  {'Gain':>8s}  {u.z + '/' + u.d:>6s}  Summits")

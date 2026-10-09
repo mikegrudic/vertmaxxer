@@ -89,25 +89,29 @@ def _route(edges, m, start, end, proven, min_loop, min_loop_frac, heads=None, an
 
 
 def _walk_to_trails(edges, start, max_m):
-    """Ids of the road edges on the shortest walk from ``start`` to the nearest trail network with at least
-    MIN_TRAIL_NET of trail, if one is within ``max_m``."""
+    """Ids of the road edges on the shortest walks from ``start`` to each trail network with at least
+    MIN_TRAIL_NET of trail within ``max_m``: from a start in town, the ways to the trails."""
     T = nx.Graph()
     for e in edges:
         if not e["road"]:  # a loop with one junction is a self-loop: it counts toward its network's size
             T.add_edge(e["u"], e["v"], w=e["length"])
-    trails = {n for c in nx.connected_components(T) if T.subgraph(c).size(weight="w") >= core.MIN_TRAIL_NET for n in c}
+    networks = [c for c in nx.connected_components(T) if T.subgraph(c).size(weight="w") >= core.MIN_TRAIL_NET]
     G, by = nx.Graph(), {}
     for e in edges:
         if e["u"] != e["v"] and G.get_edge_data(e["u"], e["v"], {}).get("w", np.inf) > e["length"]:
             G.add_edge(e["u"], e["v"], w=e["length"])
             by[frozenset((e["u"], e["v"]))] = e
-    if start not in G or start in trails:
+    if start not in G:
         return set()
     dist, path = nx.single_source_dijkstra(G, start, cutoff=max_m, weight="w")
-    near = min((n for n in dist if n in trails), key=dist.get, default=None)
-    if near is None:
-        return set()
-    return {id(by[frozenset(p)]) for p in zip(path[near], path[near][1:]) if by[frozenset(p)]["road"]}
+    out = set()
+    for net in networks:
+        if start in net:
+            continue
+        near = min((n for n in net if n in dist), key=dist.get, default=None)
+        if near is not None:
+            out |= {id(by[frozenset(p)]) for p in zip(path[near], path[near][1:]) if by[frozenset(p)]["road"]}
+    return out
 
 
 def _nearer_street(osm, point, min_path_m=100.0):
@@ -371,8 +375,8 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
     if any(core._haversine(*p, *q) < 200 for p in ends_ll for q in starts_ll):
         raise OptionError("the end is at the start: for a route back to the start, use a loop or another closed shape")
     if shape["loops"] and distance_mi < min_loop_mi:
-        raise OptionError(f"a {topology} needs loops of at least {min_loop_mi:g} mi (min_loop_mi), more than the "
-                          f"{distance_mi:.2f} mi allowed")
+        raise OptionError(f"a {topology} needs loops of at least {core.show_d(min_loop_mi * MI_TO_M)} (min_loop_mi), "
+                          f"more than the {core.show_d(distance_mi * MI_TO_M)} allowed")
     p2p = bool(ends_ll) or end_trailheads
     if ends_ll and end_trailheads:
         raise OptionError("give either end or end_trailheads")
@@ -503,7 +507,8 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
             length = sum(e["length"] * c for e, c in zip(edges, m0)) + (costs[starts.index(s0)] if costs else 0.0)
             if length < floor:
                 floor = length
-                print(f"Minimizing over routes of at least {core.show_d(length)}, the longest found quickly")
+                print(f"Minimizing over routes of at least {core.show_d(length)}: the longest found quickly fell "
+                      "short of 98% of the distance")
             hint, time_limit_s = m0, max(time_limit_s - first, 10.0)
         except VertmaxxerError:
             pass
@@ -596,6 +601,19 @@ def _match(edges, pts, tol, start, end):
     return np.minimum(counts, 2)
 
 
+def _turnaround(pts, tol_m=30.0):
+    """The index of an out-and-back track's turnaround (its farthest point along, halfway), or None if the track's
+    second half doesn't retrace its first."""
+    d = _along(pts)
+    if d[-1] == 0:
+        return None
+    at = lambda f: (np.interp(f * d[-1], d, pts[:, 0]), np.interp(f * d[-1], d, pts[:, 1]))  # the point f of the way
+    fs = np.arange(0.05, 0.46, 0.05)
+    if np.mean([core._haversine(*at(f), *at(1 - f)) < tol_m for f in fs]) < 0.9:
+        return None
+    return int(np.argmin(np.abs(d - d[-1] / 2)))
+
+
 def _runs_backward(route, pts):
     """Whether a closed ``route`` goes round the other way from the track ``pts``: where it passes the track's
     quarter-way point, as a share of its length, is nearer 3/4 than 1/4."""
@@ -643,6 +661,9 @@ def spurify(track, extra_mi=None, budget_mi=None, *, time_limit_s=60.0, workers=
         f'node["natural"="peak"]["name"](around:{reach + 200:.0f},{la:.6f},{lo:.6f});' for la, lo in centers) + ");out;"
     peaks = {x["id"]: (x["lat"], x["lon"], x["tags"]["name"]) for x in core._overpass(q, "peaks")["elements"]}
     anchors = [tuple(pts[0]), tuple(pts[-1])] + [(la, lo) for la, lo, _ in peaks.values()]
+    turn = _turnaround(pts)  # an out-and-back track: its turnaround becomes a node, wherever it falls on the trail
+    if turn is not None:
+        anchors.append(tuple(pts[turn]))
     closures = core.load_closures(sorted(core.CLOSURES_DIR.glob("*.json")))
     # The route's ends snap to a street when one is nearer than any trail, as in find_route.
     street = [k for k in (0, 1) if _nearer_street(osm, anchors[k])]
@@ -652,14 +673,18 @@ def spurify(track, extra_mi=None, budget_mi=None, *, time_limit_s=60.0, workers=
     at = {}
     for e in raw:
         at[e["u"]], at[e["v"]] = e["latlon"][0], e["latlon"][-1]
+    turn_id = ids[-1] if turn is not None else None
     summit = {n: name for n, (la, lo, name) in zip(ids[2:], peaks.values())
               if n in at and core._haversine(*at[n], la, lo) <= summit_m}
     start, end = ids[0], (ids[0] if closed_loop else ids[1])
-    edges = core.contract([dict(e) for e in raw], {start, end} | set(summit))
+    edges = core.contract([dict(e) for e in raw], {start, end} | set(summit) | ({turn_id} if turn_id else set()))
     core.add_elevation(edges, 50.0, dem)
     edges = _collapse_parallel(core.subdivide(edges, None))  # per-edge climb, no splitting
 
-    base = _match(edges, pts, match_m, start, end)
+    if turn is not None:  # out and back: match the way out, and run it twice
+        base = 2 * _match(edges, pts[: turn + 1], match_m, start, turn_id)
+    else:
+        base = _match(edges, pts, match_m, start, end)
     L_base = sum(e["length"] * c for e, c in zip(edges, base))
     if abs(L_base - L0) > 0.05 * L0:
         print(f"Warning: the route matched {core.show_d(L_base)} of trail for a {core.show_d(L0)} track; "

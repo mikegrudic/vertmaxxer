@@ -82,6 +82,7 @@ EARTH_RADIUS_M = 6371000.0
 MI_TO_M = 1609.344
 M_TO_FT = 3.280839895
 RESAMPLE_M = 10.0
+REPORT_SMOOTH_M = 50.0  # gain is reported at this smoothing, whatever the search used
 METRIC = False  # print distances in km and climbing in m (the CLI's --metric); returned numbers stay in mi and ft
 
 
@@ -845,6 +846,7 @@ def add_elevation(edges, smoothing_length, source):
         e["names"], e["roadpt"] = names[seg], roadpt[seg]
         e["z_raw"] = _bridge_over(dem(e["lat"], e["lon"]), si, flat[seg])
         e["z"] = _smooth(e["z_raw"], si, smoothing_length)
+        e["z_std"] = e["z"] if smoothing_length == REPORT_SMOOTH_M else _smooth(e["z_raw"], si, REPORT_SMOOTH_M)
         e["s"] = si
     if any(np.isnan(e["z_raw"]).any() for e in edges):
         raise VertmaxxerError("DEM has no data along part of the network (outside 3DEP coverage?)")
@@ -881,7 +883,7 @@ def subdivide(edges, seg_max):
             out.append(dict(
                 u=e["u"] if p == 0 else ("split", k, p),
                 v=e["v"] if p == pieces - 1 else ("split", k, p + 1),
-                lat=e["lat"][sl], lon=e["lon"][sl], z_raw=e["z_raw"][sl], z=e["z"][sl], names=e["names"][sl],
+                lat=e["lat"][sl], lon=e["lon"][sl], z_raw=e["z_raw"][sl], z=e["z"][sl], z_std=e.get("z_std", e["z"])[sl], names=e["names"][sl],
                 roadpt=e["roadpt"][sl],
                 length=e["length"] * (e["s"][i1] - e["s"][i0]) / e["s"][-1], road=e["road"],
             ))
@@ -1239,8 +1241,9 @@ def assemble(edges, m, start, end):
         e = edges[G[u][v][k]["eid"]]
         sl = slice(None) if e["u"] == u else slice(None, None, -1)
         parts.append({key: e[key][sl] for key in ("lat", "lon", "z_raw", "z", "names")})
+        parts[-1]["z_std"] = e.get("z_std", e["z"])[sl]  # edges built without it: the search's own elevation
     route = {key: np.concatenate([parts[0][key]] + [p[key][1:] for p in parts[1:]])
-             for key in ("lat", "lon", "z_raw", "z", "names")}
+             for key in ("lat", "lon", "z_raw", "z", "z_std", "names")}
     step = _haversine(route["lat"][:-1], route["lon"][:-1], route["lat"][1:], route["lon"][1:])
     route["dist"] = np.concatenate([[0.0], np.cumsum(step)])
     legs = []
@@ -1329,7 +1332,8 @@ def plot(path, edges, route, anchors, metric=False):
     ax_map.set_aspect(1 / math.cos(math.radians(np.mean(route["lat"]))))
     fig.colorbar(sc, ax=ax_map, label=f"elevation ({zu})", shrink=0.8)
     ax_prof.plot(route["dist"] / df, route["z_raw"] * zf, lw=0.8, label="unsmoothed")
-    ax_prof.plot(route["dist"] / df, route["z"] * zf, lw=1.2, label="smoothed")
+    z_std = route["z"] if route.get("z_std") is None else route["z_std"]
+    ax_prof.plot(route["dist"] / df, z_std * zf, lw=1.2, label="smoothed")
     ax_prof.set_xlabel(f"distance ({du})")
     ax_prof.set_ylabel(f"elevation ({zu})")
     for ax in (ax_map, ax_prof):

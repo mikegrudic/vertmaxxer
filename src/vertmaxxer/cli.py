@@ -85,6 +85,14 @@ class _Units:
         return ft / M_TO_FT if self.metric else ft
 
 
+def _searched_for(r):
+    """What a route proven optimal was optimal for, when not the smoothed gain reported."""
+    sm = getattr(r, "smooth_m", core.REPORT_SMOOTH_M)
+    if sm == core.REPORT_SMOOTH_M:
+        return ""
+    return " for unsmoothed gain" if sm == 0 else f" for gain smoothed over {sm:g} m"
+
+
 def _or(x, default):
     return default if x is None else x
 
@@ -151,7 +159,7 @@ def _print_route(r, u=_Units(False), show_start=False):
         print(f"Ends at {r.lat[-1]:.5f}, {r.lon[-1]:.5f}")
     print(f"Distance {u.dist(r.distance_mi):.2f} {u.d}, gain {u.gain(r.gain_ft):,.0f} {u.z} "
           f"(unsmoothed {u.gain(r.gain_raw_ft):,.0f} {u.z}), {u.gain(r.gain_ft) / u.dist(r.distance_mi):,.0f} "
-          f"{u.z}/{u.d}{'; optimal' if r.proven else ''}")
+          f"{u.z}/{u.d}{'; optimal' if r.proven else ''}{_searched_for(r) if r.proven else ''}")
     for name, length in _legs(r.legs):
         print(f"  {u.dist(length / MI_TO_M):5.2f} {u.d}  {name}")
 

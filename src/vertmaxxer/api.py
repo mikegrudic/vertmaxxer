@@ -20,7 +20,8 @@ from .core import MI_TO_M, M_TO_FT, OptionError, VertmaxxerError
 
 @dataclass
 class Route:
-    """A solved route. Arrays run along the track; ``z`` is smoothed elevation (m), ``z_raw`` unsmoothed."""
+    """A solved route. Arrays run along the track: ``z`` is elevation (m) as the search smoothed it (``smooth_m``),
+    ``z_std`` smoothed over core.REPORT_SMOOTH_M as reported, ``z_raw`` unsmoothed."""
     lat: np.ndarray
     lon: np.ndarray
     z: np.ndarray
@@ -33,6 +34,8 @@ class Route:
     end: tuple = None  # (lat, lon, label) for a traverse to a trailhead
     edges: list = field(default=None, repr=False)  # the network searched, for plotting
     anchors: list = field(default=None, repr=False)
+    z_std: np.ndarray = None
+    smooth_m: float = core.REPORT_SMOOTH_M
 
     @property
     def distance_mi(self):
@@ -40,8 +43,8 @@ class Route:
 
     @property
     def gain_ft(self):
-        """Gain from elevation smoothed over ~50 m (the figure every route is ranked by)."""
-        return float(np.sum(np.maximum(0, np.diff(self.z))) * M_TO_FT)
+        """Gain from elevation smoothed over core.REPORT_SMOOTH_M (50 m), whatever smoothing the search used."""
+        return float(np.sum(np.maximum(0, np.diff(self.z if self.z_std is None else self.z_std))) * M_TO_FT)
 
     @property
     def gain_raw_ft(self):
@@ -73,7 +76,8 @@ class Route:
         core.plot(path, self.edges, vars(self), self.anchors, metric)
 
 
-def _route(edges, m, start, end, proven, min_loop, min_loop_frac, heads=None, anchors=None, access=None):
+def _route(edges, m, start, end, proven, min_loop, min_loop_frac, heads=None, anchors=None, access=None,
+           smooth_m=core.REPORT_SMOOTH_M):
     """The solved route; with ``access`` (the real start, and the edges from it to the solver's start), that path is
     run out and back around it without counting toward the shape."""
     shape, details = core.classify(edges, m, start, end, min_loop, min_loop_frac)
@@ -85,7 +89,8 @@ def _route(edges, m, start, end, proven, min_loop, min_loop_frac, heads=None, an
         start = end = access[0]
     r = core.assemble(edges, m, start, end)
     return Route(lat=r["lat"], lon=r["lon"], z=r["z"], z_raw=r["z_raw"], dist=r["dist"], legs=r["legs"], shape=shape,
-                 details=details, proven=bool(proven), end=(heads or {}).get(end), edges=edges, anchors=anchors)
+                 details=details, proven=bool(proven), end=(heads or {}).get(end), edges=edges, anchors=anchors,
+                 z_std=r["z_std"], smooth_m=smooth_m)
 
 
 def _walk_to_trails(edges, start, max_m):
@@ -540,7 +545,7 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
                                   "crossed, which may cut the streets apart: allow running along them with "
                                   "--primary-roads") from None
         raise
-    return _route(edges, m, s, t, proven, min_loop_mi * MI_TO_M, min_loop_frac, heads, anchors, access.get(s))
+    return _route(edges, m, s, t, proven, min_loop_mi * MI_TO_M, min_loop_frac, heads, anchors, access.get(s), smooth_m)
 
 
 # ---------------------------------------------------------------- spurify
@@ -646,7 +651,7 @@ def _reversed_route(r):
     rev = lambda x: np.asarray(x)[::-1]
     return Route(lat=rev(r.lat), lon=rev(r.lon), z=rev(r.z), z_raw=rev(r.z_raw), dist=r.dist[-1] - rev(r.dist),
                  legs=r.legs[::-1], shape=r.shape, details=r.details, proven=r.proven, end=r.end, edges=r.edges,
-                 anchors=r.anchors)
+                 anchors=r.anchors, z_std=None if r.z_std is None else rev(r.z_std), smooth_m=r.smooth_m)
 
 
 @_quietly

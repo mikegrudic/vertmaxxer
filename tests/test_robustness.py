@@ -1099,3 +1099,25 @@ def test_sicko_preset(monkeypatch):
         with pytest.raises(SystemExit):
             cli.main(["--start", "44,-72", "--distance", "5"] + flags)
         assert (got["turn_penalty_ft"], got["smooth_m"], got["seg_max_m"]) == want
+
+
+class BumpyDEM(FakeDEM):  # the northward rise with 3 m bumps every 60 m
+    def __call__(self, lat, lon):
+        y = (np.asarray(lat) - 44.0) * M_PER_DEG
+        return y * 0.05 + 3 * np.sin(2 * np.pi * y / 60)
+
+
+def test_reported_gain_is_smoothed_whatever_the_search_used(offline, monkeypatch):
+    """A loop over 3 m bumps: searched on unsmoothed elevation (as --sicko does), it still reports its gain smoothed
+    over 50 m, the same figure as when searched that way; the unsmoothed gain is reported beside it."""
+    a, b = (44.0, -72.0), (44.009, -72.0)
+    east = lambda p: (p[0], p[1] + 0.006)
+    loop = [(1, [a, b], PATH), (2, [b, east(b)], PATH), (3, [east(b), east(a)], PATH), (4, [east(a), a], PATH)]
+    data = osm([(w, [(p[0] + f * (q[0] - p[0]), p[1] + f * (q[1] - p[1])) for f in np.linspace(0, 1, 41)], t)
+                for w, (p, q), t in loop])
+    offline(data)
+    monkeypatch.setattr(core, "DEM", BumpyDEM)
+    r50 = run(a, 3, "loop", smooth_m=50.0)
+    r0 = run(a, 3, "loop", smooth_m=0.0)
+    assert r0.gain_ft == pytest.approx(r50.gain_ft, rel=1e-6)
+    assert r0.gain_raw_ft > 1.3 * r0.gain_ft

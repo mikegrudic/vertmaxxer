@@ -45,6 +45,7 @@ import heapq
 import math
 import os
 import sys
+import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -890,7 +891,7 @@ def subdivide(edges, seg_max):
 def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, verbose, hint=None,
           min_loop_frac=0.0, road_time_frac=None, start_cost=None, minimize=False, min_length=0.0,
           no_turnarounds=False, turnaround_ok=(), max_road_frac=None, turn_penalty=0.0, start_road=None,
-          start_gain=None):
+          start_gain=None, stall=None):
     """Return (traversal count per edge, start node, end node, proven optimal) for the best route found.
 
     ``topology`` is a TOPOLOGIES entry. Each loop must be at least ``min_loop`` (m) long and at least
@@ -900,6 +901,8 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
     one has to climb at least that much to be worth it.
 
     An edge's optional ``cost`` (m) replaces its length in the budget, e.g. grade-adjusted time as flat distance.
+
+    With ``stall`` (s), the search stops early once it has a route and nothing better has turned up for that long.
 
     ``start_cost`` (m per start) is added to the distance when that start is used, e.g. the walk to it, with
     ``start_road`` (m) of road toward the road cap and ``start_gain`` (m) of climbing. Edges
@@ -1158,18 +1161,32 @@ def solve(edges, starts, ends, budget, topology, min_loop, time_limit, workers, 
         return value / 20
 
     class Progress(cp_model.CpSolverSolutionCallback):
-        best = None
+        best, last = None, None  # the best gain shown, and when it was found
 
         def on_solution_callback(self):
             gain = gain_m(self.ObjectiveValue(), self)
             if _improved(gain, self.best, minimize):
+                self.last = time.time()
                 score = f"score {show_z(self.ObjectiveValue() / 20)}, " if turn_units else ""
                 print(f"  {time.time() - t0:6.1f} s  gain {show_z(gain):>9s}  "
                       f"({score}bound {show_z(self.BestObjectiveBound() / 20)})")
                 self.best = gain
 
     print(f"Solving: {N} nodes, {E} edges, {time_limit:.0f} s limit, {workers} workers")
-    status = solver.Solve(md, Progress())
+    progress, done = Progress(), threading.Event()
+
+    def watch():  # stop a search that has stopped improving
+        while not done.wait(2.0):
+            if progress.last is not None and time.time() - progress.last > stall:
+                print(f"  no better route in {stall:.0f} s; stopping")
+                solver.stop_search()
+                return
+    if stall:
+        threading.Thread(target=watch, daemon=True).start()
+    try:
+        status = solver.Solve(md, progress)
+    finally:
+        done.set()
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise VertmaxxerError(_no_route(solver.StatusName(status), time_limit))
     score = (f"score {show_z(solver.ObjectiveValue() / 20)} (gain {'plus' if minimize else 'less'} the turnaround "

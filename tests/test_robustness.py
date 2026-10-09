@@ -988,3 +988,31 @@ def test_turnaround_of_an_out_and_back_track():
     assert api._turnaround(np.vstack([out, out[-2::-1]])) == len(out) - 1
     loop = np.array([(44.0 + 0.01 * np.sin(t), -72.0 + 0.01 * np.cos(t)) for t in np.linspace(0, 2 * np.pi, 200)])
     assert api._turnaround(loop) is None
+
+
+def test_driveways_are_off_limits(offline):
+    """A steep dead-end driveway off a street: with roads allowed, routes still don't run up it."""
+    st = [(44.0, -72.003 + 0.0005 * i) for i in range(13)]
+    loop = st + [(44.003, -71.997), (44.003, -72.003), st[0]]
+    drive = [st[6], (44.0025, st[6][1])]  # 280 m up the fake slope
+    offline(osm([(1, loop, {"highway": "residential", "name": "Lane Gate Road"}),
+                 (2, drive, {"highway": "service", "service": "driveway"})]))
+    r = run(st[0], 3, "any", roads=True)
+    assert not any("service" in n for n, _ in r.legs)
+
+
+def test_figure8_seed_is_two_loops_meeting_at_the_start():
+    e = lambda u, v, L, var: dict(u=u, v=v, length=L, var=var, road_len=0)
+    edges = [e("S", "A", 1000, 50), e("A", "B", 1000, 50), e("B", "S", 1000, 50),   # loop 1
+             e("S", "C", 1000, 20), e("C", "D", 1000, 20), e("D", "S", 1000, 20),   # loop 2
+             e("A", "C", 500, 5)]
+    seed = api._seed(edges, "S", 7000, core.TOPOLOGIES["figure-8"], 1609, 0.25)
+    assert list(seed) == [1, 1, 1, 1, 1, 1, 0]
+
+
+def test_figure8_seed_when_the_start_is_on_one_loop_only():
+    """One trail leaves the start: the second loop meets the first further along."""
+    e = lambda u, v, L, var: dict(u=u, v=v, length=L, var=var, road_len=0)
+    edges = [e("S", "A", 800, 50), e("A", "B", 1000, 50), e("B", "S", 800, 50),   # loop 1 through the start
+             e("A", "C", 1000, 20), e("C", "D", 1000, 20), e("D", "A", 1000, 20)]  # loop 2 through A
+    assert list(api._seed(edges, "S", 7000, core.TOPOLOGIES["figure-8"], 1609, 0.25)) == [1, 1, 1, 1, 1, 1]

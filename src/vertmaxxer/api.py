@@ -213,7 +213,9 @@ def _seed(edges, start, budget, shape, min_loop, min_loop_frac, max_road_frac=No
     Dense networks can otherwise take the solver minutes just to find a first route."""
     rw = 1.0 if max_road_frac is None else 5.0  # keep off roads where they're capped
     out_and_back = shape["loops"] in (0, None) and shape["spurs"] != 0 and shape["start"] in ("stem", None)
-    if not out_and_back and (shape["loops"] != 1 or shape["spurs"] != 0 or shape["start"] not in ("loop", "stem")):
+    figure8 = shape["loops"] == 2 and not shape["reuse"]
+    if not (out_and_back or figure8) and (shape["loops"] != 1 or shape["spurs"] != 0
+                                          or shape["start"] not in ("loop", "stem")):
         return None
 
     def counts_of(loop, stem=()):
@@ -243,6 +245,19 @@ def _seed(edges, start, budget, shape, min_loop, min_loop_frac, max_road_frac=No
             ks = [G[u][v]["k"] for u, v in zip(q, q[1:])]
             if ks and 2 * sum(edges[k]["length"] for k in ks) <= budget:
                 cands.append(counts_of((), ks))
+        return best(cands)
+    if figure8:  # a loop through the start, and a second loop through one of its points, meeting only there
+        nodes_of = lambda ks: {n for k in ks for n in (edges[k]["u"], edges[k]["v"])}
+        length = lambda ks: sum(edges[k]["length"] for k in ks)
+        cands = []
+        for first in _loops_through(edges, start, min_loop, budget - min_loop, road_weight=rw, tries=20)[:6]:
+            on = nodes_of(first)
+            room = budget - length(first)
+            for hub in list(on)[:: max(1, len(on) // 8)]:
+                for second in _loops_through(edges, hub, min_loop, room, avoid=on - {hub}, road_weight=rw, tries=10)[:2]:
+                    total = length(first) + length(second)
+                    if min_length <= total and min(length(first), length(second)) >= min_loop_frac * total * 1.01:
+                        cands.append(counts_of(first + second))
         return best(cands)
     if shape["start"] == "loop":
         lo = max(min_loop, min_length)
@@ -439,7 +454,9 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
     if primary_roads:
         edges = [dict(e, major=False) if e.get("highway") in ("primary", "primary_link") else e for e in edges]
     blocked = any(e.get("highway") in ("primary", "primary_link") and e.get("major") for e in edges)
-    if any_roads:  # major roads only where they meet others
+    # Highways only where they meet other roads; driveways (private) never.
+    edges = [e for e in edges if e.get("service") != "driveway" or e.get("way") in include]
+    if any_roads:
         edges = [e for e in edges if not e.get("major")]
     else:  # trails, and road walks between them; crossings and the start's own roads are free
         free = {id(e) for e in core.road_connectors(edges, core.CROSSING_M) if e["road"]}
@@ -514,7 +531,8 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
             pass
     try:
         m, s, t, proven = core.solve(edges, starts, ends, budget_m, shape, min_loop_mi * MI_TO_M, time_limit_s, workers,
-                                     verbose, minimize=minimize, min_length=floor, hint=hint, **common)
+                                     verbose, minimize=minimize, min_length=floor, hint=hint, **common,
+                                     stall=max(120.0, time_limit_s / 3) if time_limit_s > 240 else None)
     except VertmaxxerError as err:
         if roads_only and blocked and not primary_roads:
             raise VertmaxxerError(f"{err}. Primary roads near the start (often a town's main street) can only be "

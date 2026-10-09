@@ -1016,3 +1016,22 @@ def test_figure8_seed_when_the_start_is_on_one_loop_only():
     edges = [e("S", "A", 800, 50), e("A", "B", 1000, 50), e("B", "S", 800, 50),   # loop 1 through the start
              e("A", "C", 1000, 20), e("C", "D", 1000, 20), e("D", "A", 1000, 20)]  # loop 2 through A
     assert list(api._seed(edges, "S", 7000, core.TOPOLOGIES["figure-8"], 1609, 0.25)) == [1, 1, 1, 1, 1, 1]
+
+
+def test_crossing_kept_where_it_is_the_only_link():
+    """A street ends across from a trailhead and a mapped crosswalk joins them (as at Cold Spring's Foundry Dock):
+    the crosswalk stays. One that only joins two sidewalks across a road is still dropped."""
+    road = {"highway": "residential", "name": "The Boulevard"}
+    crossing = {"highway": "footway", "footway": "crossing"}
+    end = PTS[8]
+    across = (end[0] + 20 / M_PER_DEG, end[1])
+    data = osm([(1, PTS[:9], road), (2, [end, across], crossing), (3, line(*across, 1), PATH)])
+    edges, _ = core.build_graph(data, True, None, [PTS[0]], snap_roads=(0,))
+    assert {1, 2, 3} <= {e["way"] for e in edges}
+
+    sidewalk = {"highway": "footway", "footway": "sidewalk"}
+    west, east = (PTS[4][0], PTS[4][1] - 1e-4), (PTS[4][0], PTS[4][1] + 1e-4)
+    data = osm([(1, PTS[:9], road), (4, [(PTS[0][0], west[1]), west, (PTS[8][0], west[1])], sidewalk),
+                (5, [(PTS[0][0], east[1]), east, (PTS[8][0], east[1])], sidewalk), (6, [west, PTS[4], east], crossing)])
+    edges, _ = core.build_graph(data, True, None, [PTS[0]], snap_roads=(0,))
+    assert 6 not in {e["way"] for e in edges}

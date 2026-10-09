@@ -364,8 +364,15 @@ def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, cl
     # Included ways count as footpaths when they have no highway tag (a pier, a plaza).
     ways = [dict(el, tags={"highway": "footway", **el.get("tags", {})}) if el["id"] in include else el
             for el in osm["elements"] if el["type"] == "way"]
-    ways = [w for w in ways if "highway" in w.get("tags", {})
+    candidates = ways
+    ways = [w for w in candidates if "highway" in w.get("tags", {})
             and (w["id"] in include or _usable(w["tags"], roads, max_sac, marked_only))]
+    # A crosswalk joining two sidewalks goes with them, but one joining two ways in use (a path that starts across
+    # the street from the end of a road) is their only link.
+    used = {n for w in ways for n in w["nodes"]}
+    ways += [w for w in candidates if w.get("tags", {}).get("footway") == "crossing" and w["id"] not in include
+             and w["nodes"][0] in used and w["nodes"][-1] in used
+             and _usable({k: v for k, v in w["tags"].items() if k != "footway"}, roads, max_sac, marked_only)]
     if not ways:
         raise VertmaxxerError("No usable ways found near the trailhead(s).")
     if closed:

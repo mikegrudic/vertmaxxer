@@ -85,6 +85,10 @@ class _Units:
         return ft / M_TO_FT if self.metric else ft
 
 
+def _or(x, default):
+    return default if x is None else x
+
+
 def _settings_path():
     config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
     return Path(os.environ.get("VERTMAXXER_CONFIG") or config / "vertmaxxer" / "settings.json")
@@ -234,10 +238,13 @@ def main(argv=None):
                    help="exclude trails above this SAC scale grade (T1-T6)")
     p.add_argument("--dem", choices=["auto", "3dep", "terrarium"], default="auto",
                    help="elevation: USGS 3DEP (US) or AWS terrain tiles (worldwide); default: 3DEP in the US")
-    p.add_argument("--smooth", type=float, default=50.0, help="elevation smoothing e-folding length (m)")
-    p.add_argument("--seg-max", type=float, default=500.0, help="turnaround resolution when spurs are allowed (m)")
+    p.add_argument("--smooth", type=float, help="elevation smoothing e-folding length (m; default 50)")
+    p.add_argument("--seg-max", type=float, help="turnaround resolution when spurs are allowed (m; default 500)")
     p.add_argument("--turn-penalty", type=float, metavar="GAIN",
                    help="climb a turnaround must be worth, in ft (m with --metric); default 30 ft, 0 for free turnarounds")
+    p.add_argument("--sicko", action="store_true",
+                   help="every bump counts: free turnarounds every 50 m on unsmoothed elevation (--turn-penalty 0 "
+                        "--smooth 0 --seg-max 50, each overridable)")
     p.add_argument("--time-limit", type=float,
                    help="solver time limit (s; default 120, or 600 for figure-8, dumbbell and double-lollipop)")
     p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1), help="solver threads")
@@ -273,9 +280,10 @@ def main(argv=None):
                        minimize=a.minimize, min_loop_mi=1.0 if a.min_loop is None else u.to_mi(a.min_loop),
                        min_loop_frac=a.min_loop_frac,
                        max_sac=a.max_sac,
-                       dem=a.dem, smooth_m=a.smooth, seg_max_m=a.seg_max, time_limit_s=a.time_limit,
+                       dem=a.dem, smooth_m=_or(a.smooth, 0.0 if a.sicko else 50.0),
+                       seg_max_m=_or(a.seg_max, 50.0 if a.sicko else 500.0), time_limit_s=a.time_limit,
                        workers=a.workers, verbose=a.verbose,
-                       turn_penalty_ft=TURN_PENALTY_FT if a.turn_penalty is None else u.to_ft(a.turn_penalty))
+                       turn_penalty_ft=_or(u.to_ft(a.turn_penalty), 0.0 if a.sicko else TURN_PENALTY_FT))
     except OptionError as err:
         p.error(_cli_message(err))
     except VertmaxxerError as err:

@@ -466,15 +466,36 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
         access_road = [2 * sum(edges[k]["road_len"] for k in spur) for _, spur, _ in access.values()]
         access_gain = [sum(edges[k]["var"] for k in spur) for _, spur, _ in access.values()]
     hint = None if budget_flat or ends else _seed(
-        edges, starts[0], budget - (costs[0] if costs else 0.0), shape, min_loop_mi * MI_TO_M, min_loop_frac, None if any_roads else max_road_fraction,
-        min_length=0.98 * budget if minimize else 0.0, minimize=minimize)
+        edges, starts[0], budget - (costs[0] if costs else 0.0), shape, min_loop_mi * MI_TO_M, min_loop_frac,
+        None if any_roads else max_road_fraction, min_length=0.98 * budget if minimize else 0.0, minimize=minimize)
+    floor = 0.98 * budget if minimize else 0.0
+    common = dict(min_loop_frac=min_loop_frac, road_time_frac=road_time_frac,
+                  max_road_frac=None if any_roads else max_road_fraction,
+                  turn_penalty=TURN_PENALTY_M if shape["spurs"] != 0 else 0.0, start_cost=costs,
+                  start_road=access_road, start_gain=access_gain)
+    budget_m = budget_flat or budget
+    if minimize and hint is None:
+        # A route long enough to minimize from is hard to find directly: the length has to land in a narrow band.
+        # The hilliest route tends to fill the budget, so find one first and minimize from it, its length (if
+        # under 98% of the budget) as the floor.
+        print("Finding a long route to start from...")
+        first = min(60.0, time_limit_s / 3)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                m0, s0, _, _ = core.solve(edges, starts, ends, budget_m, shape, min_loop_mi * MI_TO_M, first, workers,
+                                          False, hint=_seed(edges, starts[0], budget - (costs[0] if costs else 0.0),
+                                                            shape, min_loop_mi * MI_TO_M, min_loop_frac,
+                                                            common["max_road_frac"]), **common)
+            length = sum(e["length"] * c for e, c in zip(edges, m0)) + (costs[starts.index(s0)] if costs else 0.0)
+            if length < floor:
+                floor = length
+                print(f"Minimizing over routes of at least {core.show_d(length)}, the longest found quickly")
+            hint, time_limit_s = m0, max(time_limit_s - first, 10.0)
+        except VertmaxxerError:
+            pass
     try:
-        m, s, t, proven = core.solve(edges, starts, ends, budget_flat or budget, shape, min_loop_mi * MI_TO_M, time_limit_s, workers,
-                                     verbose, min_loop_frac=min_loop_frac, road_time_frac=road_time_frac,
-                                     minimize=minimize, max_road_frac=None if any_roads else max_road_fraction,
-                                     min_length=0.98 * budget if minimize else 0.0,
-                                     turn_penalty=TURN_PENALTY_M if shape["spurs"] != 0 else 0.0, hint=hint,
-                                     start_cost=costs, start_road=access_road, start_gain=access_gain)
+        m, s, t, proven = core.solve(edges, starts, ends, budget_m, shape, min_loop_mi * MI_TO_M, time_limit_s, workers,
+                                     verbose, minimize=minimize, min_length=floor, hint=hint, **common)
     except VertmaxxerError as err:
         if roads_only and blocked and not primary_roads:
             raise VertmaxxerError(f"{err}. Primary roads near the start (often a town's main street) can only be "

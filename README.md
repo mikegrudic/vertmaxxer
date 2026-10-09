@@ -98,7 +98,7 @@ By default it plays by the same rules as the published survey:
 | `--roads-only` | Roads only, paved or dirt: no trails, tracks, driveways or parking aisles. Highways (OSM primary and trunk) can be crossed but not followed |
 | `--paved-only` | Leave out roads tagged as unpaved (gravel, dirt, ...). Many roads have no surface tag; those count as paved |
 | `--ways FILE` | Add or exclude particular OSM ways (see Road runs below) |
-| `--minimize` | Find the flattest route instead, covering at least 98% of `--distance`. Works well for loops and road runs; a lollipop in a big trail network may find no route in the time limit |
+| `--minimize` | Find the flattest route instead, covering at least 98% of `--distance`. Works well for loops and road runs. Elsewhere it starts from the hilliest route and works down, so a lollipop in a big trail network can stay far from the flattest; give it a longer `--time-limit` |
 | `--primary-roads` | Allow running along primary roads (often a town's main street), not just across them |
 | `--max-road-fraction F` | At most this share of the distance on roads (default 0.1; 0 for trails only) |
 | `--trailhead-roads M` | Walkable roads around the start, in meters (default 400; 0 for none) |

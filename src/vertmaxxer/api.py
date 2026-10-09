@@ -365,7 +365,7 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
                         ("min_loop_mi", min_loop_mi, np.inf), ("trailhead_roads_m", trailhead_roads_m, np.inf),
                         ("turn_penalty_ft", turn_penalty_ft, np.inf)):
         if not 0 <= x <= hi:
-            raise OptionError(f"{name} must be between 0 and {hi}")
+            raise OptionError(f"{name} must be 0 or more" if hi == np.inf else f"{name} must be between 0 and {hi}")
     budget_flat = None  # grade-adjusted (flat-equivalent) m, with a time at a GAP
     if time_h is not None:
         if distance_mi is not None:

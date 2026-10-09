@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 
+import networkx as nx
 import numpy as np
 import pytest
 
@@ -1035,3 +1036,24 @@ def test_crossing_kept_where_it_is_the_only_link():
                 (5, [(PTS[0][0], east[1]), east, (PTS[8][0], east[1])], sidewalk), (6, [west, PTS[4], east], crossing)])
     edges, _ = core.build_graph(data, True, None, [PTS[0]], snap_roads=(0,))
     assert 6 not in {e["way"] for e in edges}
+
+
+def test_bundled_links_join_a_road_end_to_a_trail(monkeypatch, tmp_path):
+    """A street ends 11 m short of a trail with no shared node in OSM (Kemble Avenue and the Foundry Preserve in
+    Cold Spring): a links file joins them. Without it they stay apart, as a road end isn't bridged automatically."""
+    road = {"highway": "residential", "name": "Kemble Avenue"}
+    end = PTS[8]
+    trail_start = (end[0] + 11 / M_PER_DEG, end[1])
+    data = osm([(1, PTS[:9], road), (2, line(*trail_start, 1), PATH)])
+    ids = {(n["lat"], n["lon"]): n["id"] for n in data["elements"] if n["type"] == "node"}
+    a, b = ids[(round(end[0], 7), round(end[1], 7))], ids[(round(trail_start[0], 7), round(trail_start[1], 7))]
+
+    def joined():
+        edges, _ = core.build_graph(data, True, None, [PTS[0]], snap_roads=(0,))
+        G = nx.Graph([(e["u"], e["v"]) for e in edges])
+        return b in G and nx.has_path(G, a, b)
+
+    monkeypatch.setattr(core, "LINKS_DIR", tmp_path, raising=False)
+    assert not joined()
+    (tmp_path / "kemble.json").write_text(json.dumps({"links": [[a, b]]}))
+    assert joined()

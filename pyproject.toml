@@ -38,4 +38,4 @@ Issues = "https://github.com/mikegrudic/vertmaxxer/issues"
 version = {attr = "vertmaxxer.__version__"}
 
 [tool.setuptools.package-data]
-vertmaxxer = ["data/*.dat", "data/closures/*.json"]
+vertmaxxer = ["data/*.dat", "data/closures/*.json", "data/links/*.json"]

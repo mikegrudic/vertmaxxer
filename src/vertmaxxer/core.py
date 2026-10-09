@@ -417,6 +417,8 @@ def build_graph(osm, roads, max_sac, anchors, extra_ids=(), connectors_m=0.0, cl
 
     count = Counter(n for w in ways for n in w["nodes"])
     gaps = _mapping_gaps(ways, nodes, count)
+    gaps += [(a, b) for path in sorted(LINKS_DIR.glob("*.json")) for a, b in json.load(open(path))["links"]
+             if a in count and b in count and (a, b) not in gaps and (b, a) not in gaps]
     junctions = {n for n, c in count.items() if c > 1} | set(anchor_ids) | set(extra_ids)
     junctions |= {w["nodes"][0] for w in ways} | {w["nodes"][-1] for w in ways}
     junctions |= {n for gap in gaps for n in gap}
@@ -479,6 +481,9 @@ CROSSING_M = 50.0  # road stretches this short joining two trails are crossings,
 EXCLUDED_ENDS = [(44.27060, -71.30330, 500.0)]
 EXCLUDED_END_ROADS = {"Mount Washington Auto Road", "Breakneck Road"}
 CLOSURES_DIR = Path(__file__).parent / "data" / "closures"
+# Node pairs joined on the ground but not in OSM ("links": [[node, node], ...]), e.g. a street that ends at a trail
+# a few meters off: a road end isn't bridged automatically, as many stop short of a path behind a fence.
+LINKS_DIR = Path(__file__).parent / "data" / "links"
 
 NOT_ROUTES = ("driveway", "parking_aisle", "drive-through")  # service roads nobody runs
 

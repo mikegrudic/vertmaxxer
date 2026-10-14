@@ -208,7 +208,7 @@ def main(argv=None):
     pace.add_argument("--gap", type=_clock, metavar="M:SS",
                       help="with --time: grade-adjusted pace per mile (or km) (Strava GAP); climbs and steep descents "
                            "cost more")
-    p.add_argument("--topology", choices=core.TOPOLOGIES, default="lollipop", help="route shape (default lollipop)")
+    p.add_argument("--topology", choices=core.TOPOLOGIES, help="route shape (default lollipop; any with --sicko)")
     p.add_argument("--end", type=_latlon, action="append", metavar="LAT,LON",
                    help="lat,lon of a finish for point-to-point routes; repeatable")
     p.add_argument("--end-trailheads", action="store_true",
@@ -251,8 +251,8 @@ def main(argv=None):
     p.add_argument("--turn-penalty", type=float, metavar="GAIN",
                    help="climb a turnaround must be worth, in ft (m with --metric); default 30 ft, 0 for free turnarounds")
     p.add_argument("--sicko", action="store_true",
-                   help="every bump counts: free turnarounds every 50 m on unsmoothed elevation (--turn-penalty 0 "
-                        "--smooth 0 --seg-max 50, each overridable)")
+                   help="every bump counts: any shape, with free turnarounds every 50 m on unsmoothed elevation "
+                        "(--topology any --turn-penalty 0 --smooth 0 --seg-max 50, each overridable)")
     p.add_argument("--time-limit", type=float,
                    help="solver time limit (s; default 120, or 600 for figure-8, dumbbell and double-lollipop)")
     p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1), help="solver threads")
@@ -261,6 +261,7 @@ def main(argv=None):
     p.add_argument("--plot", help="also write a map + profile figure here (needs matplotlib)")
     _add_units(p)
     a = p.parse_args(_attach_negative(sys.argv[1:] if argv is None else argv))
+    a.topology = _or(a.topology, "any" if a.sicko else "lollipop")
     _line_buffered()
     u = _units_setting(a)
     if a.max_road_fraction is not None and (a.roads or a.roads_only):

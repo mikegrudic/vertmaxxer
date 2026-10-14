@@ -1086,19 +1086,20 @@ def test_turn_penalty_option_in_the_users_units(monkeypatch):
 
 
 def test_sicko_preset(monkeypatch):
-    """--sicko: free turnarounds every 50 m on unsmoothed elevation; options given explicitly still win."""
+    """--sicko: any shape, with free turnarounds every 50 m on unsmoothed elevation; options given explicitly
+    still win."""
     got = {}
 
     def capture(start, distance_mi=None, topology=None, **k):
         got.clear()
-        got.update(k)
+        got.update(k, topology=topology)
         raise vm.VertmaxxerError("stop")
     monkeypatch.setattr(cli, "find_route", capture)
-    for flags, want in (([], (30, 50, 500)), (["--sicko"], (0, 0, 50)),
-                        (["--sicko", "--seg-max", "25", "--smooth", "10"], (0, 10, 25))):
+    for flags, want in (([], ("lollipop", 30, 50, 500)), (["--sicko"], ("any", 0, 0, 50)),
+                        (["--sicko", "--seg-max", "25", "--smooth", "10", "--topology", "loop"], ("loop", 0, 10, 25))):
         with pytest.raises(SystemExit):
             cli.main(["--start", "44,-72", "--distance", "5"] + flags)
-        assert (got["turn_penalty_ft"], got["smooth_m"], got["seg_max_m"]) == want
+        assert (got["topology"], got["turn_penalty_ft"], got["smooth_m"], got["seg_max_m"]) == want
 
 
 class BumpyDEM(FakeDEM):  # the northward rise with 3 m bumps every 60 m

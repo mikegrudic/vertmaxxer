@@ -93,6 +93,17 @@ def _searched_for(r):
     return " for unsmoothed gain" if sm == 0 else f" for gain smoothed over {sm:g} m"
 
 
+def _live_map(wanted):
+    """A live map for --live, when output goes to a terminal."""
+    if not wanted:
+        return None
+    if not sys.stdout.isatty():
+        print("--live needs a terminal; not drawing", file=sys.stderr)
+        return None
+    from .live import LiveMap
+    return LiveMap()
+
+
 def _or(x, default):
     return default if x is None else x
 
@@ -250,6 +261,7 @@ def main(argv=None):
     p.add_argument("--seg-max", type=float, help="turnaround resolution when spurs are allowed (m; default 500)")
     p.add_argument("--turn-penalty", type=float, metavar="GAIN",
                    help="climb a turnaround must be worth, in ft (m with --metric); default 30 ft, 0 for free turnarounds")
+    p.add_argument("--live", action="store_true", help="draw the best route so far in the terminal as the search runs")
     p.add_argument("--sicko", action="store_true",
                    help="every bump counts: any shape, with free turnarounds every 50 m on unsmoothed elevation "
                         "(--topology any --turn-penalty 0 --smooth 0 --seg-max 50, each overridable)")
@@ -292,7 +304,8 @@ def main(argv=None):
                        dem=a.dem, smooth_m=_or(a.smooth, 0.0 if a.sicko else 50.0),
                        seg_max_m=_or(a.seg_max, 50.0 if a.sicko else 500.0), time_limit_s=a.time_limit,
                        workers=a.workers, verbose=a.verbose,
-                       turn_penalty_ft=_or(u.to_ft(a.turn_penalty), 0.0 if a.sicko else TURN_PENALTY_FT))
+                       turn_penalty_ft=_or(u.to_ft(a.turn_penalty), 0.0 if a.sicko else TURN_PENALTY_FT),
+                       on_route=_live_map(a.live))
     except OptionError as err:
         p.error(_cli_message(err))
     except VertmaxxerError as err:

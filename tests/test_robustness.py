@@ -1122,3 +1122,55 @@ def test_reported_gain_is_smoothed_whatever_the_search_used(offline, monkeypatch
     r0 = run(a, 3, "loop", smooth_m=0.0)
     assert r0.gain_ft == pytest.approx(r50.gain_ft, rel=1e-6)
     assert r0.gain_raw_ft > 1.3 * r0.gain_ft
+
+
+def _square_edges():
+    """A 1 km square loop (nodes 1-4) and a 300 m spur off node 1 (to node 5), with polylines."""
+    c = [(44.0, -72.0), (44.009, -72.0), (44.009, -71.9875), (44.0, -71.9875)]
+    seg = lambda p, q: (np.linspace(p[0], q[0], 11), np.linspace(p[1], q[1], 11))
+    out = []
+    for k, (u, v) in enumerate([(1, 2), (2, 3), (3, 4), (4, 1)]):
+        la, lo = seg(c[u - 1], c[v - 1])
+        out.append(dict(u=u, v=v, lat=la, lon=lo))
+    la, lo = seg(c[0], (44.0, -72.004))
+    out.append(dict(u=1, v=5, lat=la, lon=lo))
+    return out
+
+
+def test_live_map_draws_and_redraws_in_place():
+    from vertmaxxer import live
+    import io
+    out = io.StringIO()
+    lm = live.LiveMap(out, width=40, height=12)
+    edges, m = _square_edges(), np.array([1, 1, 1, 1, 0])
+    lm(edges, m, 100.0, 150.0, 1.5, start=1)
+    first = out.getvalue()
+    assert any(0x2800 < ord(ch) <= 0x28FF for ch in first)  # braille dots
+    assert "gain" in first and "bound" in first and live.ROUTE in first  # the route in its own color
+    lm(edges, m, 120.0, 150.0, 2.0, start=1, final=True)
+    assert f"\x1b[{first.count(chr(10))}F" in out.getvalue()[len(first):]  # back up over the first frame
+
+
+def test_find_route_reports_each_better_route(offline):
+    offline(osm([(1, PTS, PATH)]))
+    calls = []
+    run(PTS[0], 4, "out-and-back", on_route=lambda edges, m, gain, bound, t, start, final=False:
+        calls.append((len(edges), len(m), final)))
+    assert calls and calls[-1][2] and all(n == k for n, k, _ in calls)
+
+
+def test_live_option_needs_a_terminal(monkeypatch, capsys):
+    from vertmaxxer import live
+    got = {}
+
+    def capture(start, distance_mi=None, topology=None, **k):
+        got.update(k)
+        raise vm.VertmaxxerError("stop")
+    monkeypatch.setattr(cli, "find_route", capture)
+    with pytest.raises(SystemExit):
+        cli.main(["--start", "44,-72", "--distance", "5", "--live"])
+    assert got["on_route"] is None and "--live" in capsys.readouterr().err
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    with pytest.raises(SystemExit):
+        cli.main(["--start", "44,-72", "--distance", "5", "--live"])
+    assert isinstance(got["on_route"], live.LiveMap)

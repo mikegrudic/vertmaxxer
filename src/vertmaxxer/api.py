@@ -342,7 +342,8 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
                end_trailheads=False, min_end_dist_mi=1.0, max_road_fraction=0.1, trailhead_roads_m=400.0, roads=False, roads_only=False, paved_only=False,
                road_time_frac=None, ways=None, closures=(), any_end=False, minimize=False, min_loop_mi=1.0,
                min_loop_frac=0.25, max_sac=None, dem="auto", smooth_m=50.0, seg_max_m=500.0, time_limit_s=None,
-               workers=8, verbose=False, marked_only=False, primary_roads=False, turn_penalty_ft=TURN_PENALTY_FT):
+               workers=8, verbose=False, marked_only=False, primary_roads=False, turn_penalty_ft=TURN_PENALTY_FT,
+               on_route=None):
     """The route with the most climbing (or with ``minimize``, the least) from ``start``.
 
     ``start`` is (lat, lon), or a list of them to let the solver pick. ``distance_mi`` is the most the route may
@@ -356,6 +357,9 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
     list) of closed segments, besides the bundled ones. ``max_sac`` (1-6) skips harder trails, and
     ``marked_only`` herd paths and other informal or unmarked ways. Primary roads are only crossed unless
     ``primary_roads`` (trunk roads always). ``quiet`` silences progress output.
+
+    ``on_route(edges, m, gain_m, bound_m, elapsed_s, start, final=False)``, if given, is called with each better
+    route the search finds (``m`` counts the runs of each of ``edges``), and the final one: e.g. a ``live.LiveMap``.
 
     Raises OptionError (a ValueError) for invalid options, and VertmaxxerError if no route fits or a data source
     fails.
@@ -538,7 +542,8 @@ def find_route(start, distance_mi=None, topology="lollipop", *, time_h=None, pac
     try:
         m, s, t, proven = core.solve(edges, starts, ends, budget_m, shape, min_loop_mi * MI_TO_M, time_limit_s, workers,
                                      verbose, minimize=minimize, min_length=floor, hint=hint, **common,
-                                     stall=max(120.0, time_limit_s / 3) if time_limit_s > 240 else None)
+                                     stall=max(120.0, time_limit_s / 3) if time_limit_s > 240 else None,
+                                     on_route=on_route)
     except VertmaxxerError as err:
         if roads_only and blocked and not primary_roads:
             raise VertmaxxerError(f"{err}. Primary roads near the start (often a town's main street) can only be "
